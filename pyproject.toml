@@ -19,7 +19,7 @@ classifiers = [
 
 dependencies = [
     # 只依赖 taifeng 稳定层；具体隔离后端的 SDK 一律走 optional extras（ADR 0001 决策 5）
-    "taifeng>=2026.9.28.16",
+    "taifeng>=2026.9.30.1",
 ]
 
 [project.optional-dependencies]

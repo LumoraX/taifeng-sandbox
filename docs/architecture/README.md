@@ -32,8 +32,8 @@ taifeng 工具层（审批 / 黑名单 / env 白名单 / 超时 / 截断 / 取�
 
 | 协议 | taifeng 位置 | 在 taifeng 稳定层 |
 | --- | --- | --- |
-| `CommandExecutor` / `CommandProcess` / `CommandSpec` | `taifeng.tool.command_executor` | taifeng main 已导出，**尚未发版**（PyPI 最新 2026.9.28.16 不含） |
+| `CommandExecutor` / `CommandProcess` / `CommandSpec` | `taifeng.tool.command_executor` | 是（taifeng ≥ 2026.9.30.1） |
 | `ScriptExecutor` | `taifeng.skill.scripts.executor` | 是 |
 | `WorkspaceFS` | 尚不存在 | — |
 
-另：taifeng 目前没有 `py.typed` 标记，本仓代码一旦 import taifeng，mypy strict 会报 `import-untyped`。需要 taifeng 补上标记后发版。
+taifeng 自 2026.9.30.1 起带 `py.typed`，本仓对 taifeng 协议的使用受 mypy strict 检查。
