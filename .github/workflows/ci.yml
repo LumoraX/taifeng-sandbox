@@ -1,0 +1,59 @@
+# 持续门禁 —— 每次 push main / 每个 PR 都跑，口径与 taifeng 门禁一致。
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支上新的推送作废旧的排队运行，红绿只反映 HEAD
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: 全量测试 (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # 与 pyproject classifiers 声明的受支持版本一一对应
+        python-version: ["3.12", "3.13"]
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+
+      - name: 安装 uv
+        # setup-uv 不发滚动大版本 tag，按上游写法用 commit SHA 钉死 + 版本号注释
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: 校验锁文件与 pyproject 一致
+        run: uv lock --check
+
+      - name: 全量测试
+        run: uv run --python ${{ matrix.python-version }} --extra dev pytest tests/ -q
+
+  lint:
+    # F 未用/未定义名 · S108 硬编码 /tmp · I 导入排序 · TC 仅类型用 import 进 TYPE_CHECKING。
+    # I 与 TC 必须同时入闸：TC 挪动 import 会制造 I001，单卡任一条都会被另一条反弹。
+    name: 静态检查 (ruff F + S108 + I + TC · mypy strict)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: ruff F + S108 + I + TC 必须零错
+        run: uv run --frozen --extra dev ruff check --select F,S108,I,TC src tests
+
+      - name: mypy strict 必须零错
+        run: uv run --frozen --extra dev mypy src/

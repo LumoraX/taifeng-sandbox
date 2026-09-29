@@ -1,0 +1,36 @@
+# 本地工具 / 协作产物
+.claude/
+.codex/
+.history/
+.superpowers/
+openspec/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.env
+
+# 测试 / 静态检查缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# taifeng 运行产物
+.taifeng/
+threads/
+*.jsonl
+*.db
+*.db-shm
+*.db-wal
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store

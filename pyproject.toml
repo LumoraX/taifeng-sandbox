@@ -1,0 +1,61 @@
+[project]
+name = "taifeng-sandbox"
+version = "2026.9.29.15"
+description = "taifeng 执行隔离适配层 —— 把 CommandExecutor / ScriptExecutor 接到本机隔离、容器与远端沙盒"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Taifeng Contributors" },
+]
+keywords = ["llm", "agent", "sandbox", "taifeng"]
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+dependencies = [
+    # 只依赖 taifeng 稳定层；具体隔离后端的 SDK 一律走 optional extras（ADR 0001 决策 5）
+    "taifeng>=2026.9.28.16",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/taifeng_sandbox"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "ASYNC", "S", "B", "C4", "RET", "SIM", "TC"]
+# S101(裸 assert)放行：沿用 taifeng 口径——assert 只用于 mypy strict 要求的类型收窄
+# (断内部不变量)；外部输入校验一律抛异常，不用 assert。
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+# S108(硬编码 /tmp)：tests/ 里只允许作占位字符串，真落盘必须用 tmp_path fixture
+"tests/**" = ["S108"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_ignores = true
