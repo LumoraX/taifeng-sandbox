@@ -1,6 +1,8 @@
 # 架构总览（活文档）
 
 > 本目录只描述**当前生效的设计**；为什么这么定见 [../decisions/](../decisions/README.md)。
+>
+> 相关：[接口参考](reference.md) · [线协议第 1 版](protocol.md)
 
 ## 现状
 

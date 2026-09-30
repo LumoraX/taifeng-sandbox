@@ -116,7 +116,14 @@ workspace = DaemonWorkspace(client)                # 文件访问，返回 FileM
 | `k8s` | Pod | 同上 | 未开始 |
 | `e2b` / `daytona` | 云沙盒 | 直接适配其 SDK（它们自带沙盒内守护进程） | 未开始 |
 
-设计与已知限制见 [docs/architecture/](docs/architecture/README.md)，分层取舍见 [ADR 0002](docs/decisions/0002-in-sandbox-daemon.md)、[ADR 0003](docs/decisions/0003-protocol-v1-and-trust-boundaries.md)。
+## 文档
+
+| 文档 | 内容 |
+| --- | --- |
+| [接口参考](docs/architecture/reference.md) | 隔离策略的字段与预设、各执行器的行为、容器配置的全部字段、守护进程客户端、异常 |
+| [线协议](docs/architecture/protocol.md) | 宿主与沙盒内守护进程之间的协议：给别的环境写客户端、或换一种语言实现守护进程时用 |
+| [架构总览](docs/architecture/README.md) | 分层、信任边界、已知限制 |
+| [决策记录](docs/decisions/README.md) | 分层取舍见 [ADR 0002](docs/decisions/0002-in-sandbox-daemon.md)、[ADR 0003](docs/decisions/0003-protocol-v1-and-trust-boundaries.md) |
 
 ## 开发
 
