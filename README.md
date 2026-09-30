@@ -71,6 +71,40 @@ async with await DockerEnvironment.create(config) as sandbox:
 
 隔离后端不可用时构造即失败（`SandboxUnavailableError`），不会退回无隔离执行。
 
+### 直接使用守护进程
+
+`DockerEnvironment` 之外的环境（自己管理的容器、远端主机）可以直接用线协议的客户端：`daemon_source()` 取守护进程的源码（单文件、只用标准库、Python 3.9+），在目标环境里启动它，再用 `StdioTransport` 或自己实现的 `Transport` 连上去。
+
+```python
+from taifeng_sandbox.daemon import (
+    DaemonClient,
+    DaemonCommandExecutor,
+    DaemonWorkspace,
+    StdioTransport,
+    daemon_source,
+)
+
+# 任何能把标准输入输出接到目标环境的命令都可以；--root 是文件访问的根目录
+transport = await StdioTransport.spawn(
+    ["docker", "exec", "-i", container_id, "python3", "-c", daemon_source(), "--root", "/work"]
+)
+client = await DaemonClient.connect(transport)     # 握手并核对协议版本（PROTOCOL_VERSION）
+executor = DaemonCommandExecutor(client)           # 实现 taifeng.CommandExecutor，返回 RemoteProcess
+workspace = DaemonWorkspace(client)                # 文件访问，返回 FileMetadata / DirectoryEntry
+```
+
+线协议见 [ADR 0003](docs/decisions/0003-protocol-v1-and-trust-boundaries.md)。
+
+### 异常
+
+| 异常 | 何时抛出 |
+| --- | --- |
+| `SandboxPolicyError`（`ValueError`） | 隔离策略本身不合法：相对路径、互相矛盾的根目录 |
+| `SandboxError`（`OSError`） | 下面三种的基类。是 `OSError` 的子类，taifeng 工具层按「启动失败」处理 |
+| `SandboxUnavailableError` | 隔离后端在当前环境不可用：缺可执行文件、平台不支持、守护进程连不上 |
+| `SandboxProtocolError` | 与守护进程的交互失败：版本不兼容、响应畸形、连接中断 |
+| `SandboxRemoteError` | 守护进程明确返回的错误，`code` 是线协议错误码 |
+
 ## 后端
 
 每个后端一个 optional extra，核心包除 taifeng 外没有运行时依赖。
