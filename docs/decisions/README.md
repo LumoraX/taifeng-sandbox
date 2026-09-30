@@ -6,3 +6,4 @@
 | --- | --- | --- |
 | [0001](0001-positioning-and-boundaries.md) | 定位与边界 —— taifeng 执行类协议的隔离实现，独立于内核发布 | Accepted |
 | [0002](0002-in-sandbox-daemon.md) | 容器与远端后端走「沙盒内守护进程」范式 | Accepted |
+| [0003](0003-protocol-v1-and-trust-boundaries.md) | 线协议第 1 版与信任边界 | Accepted |

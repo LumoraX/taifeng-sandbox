@@ -11,7 +11,7 @@ authors = [
 ]
 keywords = ["llm", "agent", "sandbox", "taifeng"]
 classifiers = [
-    "Development Status :: 1 - Planning",
+    "Development Status :: 3 - Alpha",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -23,6 +23,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# 各后端只依赖宿主机上的系统命令（sandbox-exec / bwrap / docker），没有 Python 依赖；
+# extra 仍然保留，用来声明「启用了哪个后端」，将来需要 SDK 时不改安装方式（ADR 0001 决策 5）
+local = []
+docker = []
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -48,6 +52,8 @@ select = ["E", "F", "W", "I", "N", "UP", "ASYNC", "S", "B", "C4", "RET", "SIM", 
 ignore = ["S101"]
 
 [tool.ruff.lint.per-file-ignores]
+# 守护进程要注入到任意镜像里单文件运行，语法须兼容 Python 3.9，不套用 py312 的现代化改写
+"src/taifeng_sandbox/daemon/server.py" = ["UP"]
 # S108(硬编码 /tmp)：tests/ 里只允许作占位字符串，真落盘必须用 tmp_path fixture
 "tests/**" = ["S108"]
 

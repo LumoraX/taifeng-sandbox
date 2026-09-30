@@ -36,6 +36,16 @@ jobs:
       - name: 校验锁文件与 pyproject 一致
         run: uv lock --check
 
+      - name: 安装 bubblewrap 并放开用户命名空间
+        # bubblewrap 用例是真跑的；Ubuntu 24.04 默认用 AppArmor 限制非特权用户命名空间
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: 预拉取 Docker 测试镜像
+        run: docker pull python:3.12-slim && docker pull busybox:latest
+
       - name: 全量测试
         run: uv run --python ${{ matrix.python-version }} --extra dev pytest tests/ -q
 

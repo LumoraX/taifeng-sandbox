@@ -614,7 +614,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
     { name = "taifeng", specifier = ">=2026.9.30.1" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["local", "docker", "dev"]
 
 [[package]]
 name = "typing-extensions"
