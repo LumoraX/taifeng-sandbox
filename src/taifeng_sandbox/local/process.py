@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import signal
 from typing import TYPE_CHECKING
@@ -14,18 +15,39 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
+    import taifeng
+
 
 class ProcessGroup:
-    """满足 taifeng ``CommandProcess`` 协议的进程组句柄。"""
+    """满足 taifeng ``CommandProcess`` 与 ``StreamingCommandProcess`` 协议的进程组句柄。
+
+    ``stdin`` 仅在以 ``stdin=True`` 启动时非 None；``stdout`` / ``stderr`` 始终是管道。
+    """
 
     def __init__(self, proc: asyncio.subprocess.Process) -> None:
         """包装一个以 ``start_new_session=True`` 启动的子进程。"""
         self._proc = proc
+        self._collected = False
 
     @property
     def pid(self) -> int:
         """子进程 PID（同时是进程组号）。"""
         return self._proc.pid
+
+    @property
+    def stdin(self) -> taifeng.CommandInput | None:
+        """标准输入的写入端；未以 ``stdin=True`` 启动时为 None。"""
+        return self._proc.stdin
+
+    @property
+    def stdout(self) -> taifeng.CommandOutput | None:
+        """标准输出的读取端。"""
+        return self._proc.stdout
+
+    @property
+    def stderr(self) -> taifeng.CommandOutput | None:
+        """标准错误的读取端。"""
+        return self._proc.stderr
 
     @property
     def returncode(self) -> int | None:
@@ -34,31 +56,30 @@ class ProcessGroup:
 
     async def communicate(self) -> tuple[bytes, bytes]:
         """读完 stdout / stderr 并等待退出。"""
-        return await self._proc.communicate()
+        output = await self._proc.communicate()
+        # 管道读到 EOF 且进程已退出：没有成员还需要杀，此后 kill 不再发信号
+        self._collected = True
+        return output
 
     async def wait(self) -> int:
         """等待退出，返回退出码。"""
         return await self._proc.wait()
 
     def kill(self) -> None:
-        """对整个进程组发 SIGKILL；进程组已不存在时退回只杀主进程。"""
-        if self._proc.returncode is not None:
+        """对整个进程组发 SIGKILL；输出已收完的进程上是空操作。
+
+        只看 ``_collected`` 不看 ``returncode``：shell 先退出、子进程仍占着管道时，
+        ``returncode`` 已有值，但进程组里还有成员需要杀（内核 ADR 0108）。
+        进程组不存在或无权按组杀时退回只杀主进程。
+        """
+        if self._collected:
             return
         try:
             os.killpg(self._proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            # 进程组已经退出干净
-            return
-        except PermissionError:
-            # 无权对进程组发信号（极少见）：至少杀掉主进程
-            self._kill_main()
-
-    def _kill_main(self) -> None:
-        """只杀主进程；已退出则无事可做。"""
-        try:
-            self._proc.kill()
-        except ProcessLookupError:
-            return
+        except (ProcessLookupError, PermissionError):
+            if self._proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    self._proc.kill()
 
 
 async def spawn_group(
@@ -66,15 +87,18 @@ async def spawn_group(
     *,
     cwd: str | None,
     env: Mapping[str, str],
+    stdin: bool = False,
 ) -> ProcessGroup:
-    """以新会话启动子进程，stdout / stderr 走管道，stdin 关闭。
+    """以新会话启动子进程，stdout / stderr 走管道。
+
+    ``stdin=True`` 时 stdin 也走管道，可持续写入；否则关闭（读到 EOF）。
 
     ``env`` 作为完整环境传入，不叠加宿主环境变量（taifeng ``CommandExecutor`` 契约）。
     启动失败抛 ``OSError``，由 taifeng 工具层转成 ``spawn_error``。
     """
     proc = await asyncio.create_subprocess_exec(
         *argv,
-        stdin=asyncio.subprocess.DEVNULL,
+        stdin=asyncio.subprocess.PIPE if stdin else asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,

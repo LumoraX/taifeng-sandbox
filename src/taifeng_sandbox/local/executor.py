@@ -97,7 +97,7 @@ class SeatbeltCommandExecutor:
         argv = seatbelt.build_argv(
             self._policy, command_argv(spec), sandbox_exec=self._sandbox_exec
         )
-        return await spawn_group(argv, cwd=spec.cwd, env=spec.env)
+        return await spawn_group(argv, cwd=spec.cwd, env=spec.env, stdin=spec.stdin)
 
 
 def find_bwrap() -> str | None:
@@ -148,7 +148,7 @@ class BwrapCommandExecutor:
             cwd=spec.cwd,
             unreadable_files=self._unreadable_files,
         )
-        return await spawn_group(argv, cwd=spec.cwd, env=spec.env)
+        return await spawn_group(argv, cwd=spec.cwd, env=spec.env, stdin=spec.stdin)
 
 
 def create_local_executor(policy: SandboxPolicy) -> CommandExecutor:
