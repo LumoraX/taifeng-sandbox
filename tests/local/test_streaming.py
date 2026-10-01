@@ -43,6 +43,29 @@ async def test_stdin_and_stdout_stream(tmp_path: Path) -> None:
     assert await asyncio.wait_for(proc.wait(), 10) == 0
 
 
+async def test_readline_reads_a_line_longer_than_the_asyncio_default(tmp_path: Path) -> None:
+    """一次输出 200 KiB 的单行：readline 读到完整一行，不因 asyncio 默认的 64 KiB 上限抛错。
+
+    经本机执行器起的 MCP 连接器，一条大响应就是这样的一行；超限时 readline 抛 ValueError，
+    内核的读循环随之崩掉。
+    """
+    script = tmp_path / "big.py"
+    script.write_text("import sys\nsys.stdout.write('x' * 204800 + '\\n')\nsys.stdout.flush()\n")
+    executor = create_local_executor(SandboxPolicy.workspace_write(tmp_path))
+    proc = await executor.start(
+        taifeng.CommandSpec(
+            command=f"/usr/bin/env python3 {script}", shell=False, cwd=str(tmp_path),
+            env={"PATH": "/usr/bin:/bin"}, stdin=True,
+        )
+    )
+    assert isinstance(proc, taifeng.StreamingCommandProcess)
+    assert proc.stdin is not None and proc.stdout is not None
+    line = await asyncio.wait_for(proc.stdout.readline(), 10)
+    assert line == b"x" * 204800 + b"\n"
+    proc.stdin.close()
+    assert await asyncio.wait_for(proc.wait(), 10) == 0
+
+
 async def test_without_stdin_flag_stdin_is_none(tmp_path: Path) -> None:
     """不要 stdin 的命令读到 EOF，stdin 属性为 None。"""
     executor = create_local_executor(SandboxPolicy.workspace_write(tmp_path))

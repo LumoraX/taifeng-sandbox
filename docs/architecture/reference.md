@@ -38,7 +38,7 @@
 | --- | --- |
 | 环境变量 | `CommandSpec.env` 就是进程的完整环境，不叠加宿主环境 |
 | 进程组 | 以新会话启动；`kill()` 作用于整个进程组，shell 派生的子进程一起终止 |
-| 输出 | `communicate()` 读完两路输出并等退出；`CommandSpec.stdin=True` 时还可经 `stdin` / `stdout` / `stderr` 三个流持续读写（实现 `StreamingCommandProcess`） |
+| 输出 | `communicate()` 读完两路输出并等退出；`CommandSpec.stdin=True` 时还可经 `stdin` / `stdout` / `stderr` 三个流持续读写（实现 `StreamingCommandProcess`）。`readline()` 的单行上限是 16 MiB（与守护进程单次读写的上限一致；asyncio 默认只有 64 KiB），MCP server 的单条大响应能整行读出 |
 | 资源限制 | 不限制内存与 CPU。需要的话用容器后端 |
 
 两个后端对同一份策略的翻译：

@@ -17,6 +17,11 @@ if TYPE_CHECKING:
 
     import taifeng
 
+# 输出流的单行读取上限，也决定读缓冲暂停读取的水位（2 倍于它）。asyncio 默认 64 KiB：经本机执行器
+# 起的 MCP 连接器单条响应超过它时，内核的 readline 抛 ValueError，读循环随之崩掉。取值与守护进程单次
+# 读写的上限（``daemon.protocol.MAX_FILE_BYTES``）对齐，两类后端能交出的单条消息一样大。
+STREAM_LIMIT_BYTES = 16 * 1024 * 1024
+
 
 class ProcessGroup:
     """满足 taifeng ``CommandProcess`` 与 ``StreamingCommandProcess`` 协议的进程组句柄。
@@ -91,7 +96,8 @@ async def spawn_group(
 ) -> ProcessGroup:
     """以新会话启动子进程，stdout / stderr 走管道。
 
-    ``stdin=True`` 时 stdin 也走管道，可持续写入；否则关闭（读到 EOF）。
+    ``stdin=True`` 时 stdin 也走管道，可持续写入；否则关闭（读到 EOF）。``readline`` 的单行上限是
+    ``STREAM_LIMIT_BYTES``。
 
     ``env`` 作为完整环境传入，不叠加宿主环境变量（taifeng ``CommandExecutor`` 契约）。
     启动失败抛 ``OSError``，由 taifeng 工具层转成 ``spawn_error``。
@@ -105,6 +111,7 @@ async def spawn_group(
         env=dict(env),
         close_fds=True,
         start_new_session=True,
+        limit=STREAM_LIMIT_BYTES,
     )
     return ProcessGroup(proc)
 
