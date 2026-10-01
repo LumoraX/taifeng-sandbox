@@ -70,7 +70,7 @@
 | 输出 | 两路各自按脚本声明的 `max_output_bytes` 截断 |
 | `path_mapper` | 把宿主机上的脚本路径换成执行环境里的路径。容器里没有按相同路径挂载 skill 目录时要给 |
 
-与 taifeng 自带执行器的差异：终止是直接强杀，没有 SIGTERM 宽限期；输出在进程结束后一次性取回。
+与 taifeng 自带执行器的差异：终止是直接强杀，没有 SIGTERM 宽限期；脚本的输出在进程结束后一次性取回（脚本不需要持续对话，持续读写的进程见各执行器的 `CommandSpec.stdin=True`）。
 
 ## 容器：`taifeng_sandbox.docker`
 
@@ -161,14 +161,14 @@ tools = [
 
 | 成员 | 说明 |
 | --- | --- |
-| `root` | 守护进程根目录的真实路径（握手时上报）。握手信息里没有它时抛 `SandboxProtocolError` |
-| `resolve(path)` | 同步、不发请求：相对路径拼到 `root`，按字面折叠 `..`，落在 `root` 之外抛 `taifeng.WorkspacePathError`；返回字符串。**不跟随符号链接**，守护进程收到请求后还会按真实路径再校验 |
-| `read_bytes(path)` / `read_text(path, encoding="utf-8")` | 读文件。大文件自动分段 |
-| `write_bytes(path, data, create_parents=True)` / `write_text(…)` | 覆盖写入。不超过 16 MiB 时是原子的（守护进程写临时文件再替换）；**更大的内容分段写入，不是原子的**：第一段原子替换，之后逐段追加，读者可能看到只写了前几段的文件 |
+| `root` | 守护进程根目录的真实路径（握手时上报）。握手信息里没有它、或它不是规范的绝对路径时抛 `SandboxProtocolError` |
+| `resolve(path)` | 同步、不发请求：相对路径拼到 `root`，按字面折叠 `..`，开头多个 `/` 规整成一个，落在 `root` 之外抛 `taifeng.WorkspacePathError`；返回字符串。**不跟随符号链接**，守护进程收到请求后还会按真实路径再校验——那才是真实边界。所以内核工具的权限 target 与回显是字面路径，根内有链接时与实际读写的文件不一致（内核 `LocalWorkspaceFS` 则跟随链接），按路径写的权限规则可以被根内链接绕开；详见 [ADR 0004](../decisions/0004-streaming-processes-and-workspace-fs.md) 决策 5 |
+| `read_bytes(path)` / `read_text(path, encoding="utf-8")` | 读文件。超过 16 MiB 自动分段，**分段读不是快照**：读的过程中文件被改，结果可能新旧混杂 |
+| `write_bytes(path, data, create_parents=True)` / `write_text(…)` | 覆盖写入。不超过 16 MiB 时是原子的（守护进程写临时文件再替换）；**更大的内容分段写入，不是原子的**：第一段原子替换，之后逐段追加，读者可能看到只写了前几段的文件。覆盖保持原文件的 `rwx` 权限位（不含 setuid 等特殊位），守护进程是 root 时还保持原属主，非 root 时属主变成守护进程的用户；新建按守护进程启动时的 umask。写一个符号链接替换的是链接目标 |
 | `list_directory(path)` | 返回 `taifeng.WorkspaceEntry` 列表：`name`、`is_directory`、`is_file`、`is_symlink`（不跟随符号链接判定），按名字排序 |
 | `metadata(path)` | 返回 `taifeng.WorkspaceFileInfo`：`exists`、`is_directory`、`is_file`、`size`、`modified_at`。不存在（含路径中间某一段是文件）时 `exists=False`，不抛异常 |
 | `create_directory(path, recursive=True)` | 建目录（`WorkspaceFS` 之外的附加方法） |
-| `remove(path, recursive=False)` | 删除；目录不给 `recursive` 时须为空，根目录本身不允许删 |
+| `remove(path, recursive=False)` | 删除；目录不给 `recursive` 时须为空，根目录本身不允许删。路径按真实路径解析，**删一个符号链接删掉的是链接目标**，不是链接本身（与内核 `LocalWorkspaceFS` 一致） |
 
 每个方法都先调 `resolve`，自己校验边界，不依赖调用方先调过它。失败用标准 `OSError` 子类表达：
 
@@ -176,9 +176,11 @@ tools = [
 | --- | --- |
 | 不存在；`create_parents=False` 时父目录不存在 | `FileNotFoundError` |
 | 路径在根目录之外，含根内指向根外的符号链接 | `taifeng.WorkspacePathError`（`PermissionError` 的子类） |
-| 操作系统拒绝访问；删除根目录本身 | `PermissionError` |
-| 其他（非空目录、读目录当文件等） | `SandboxRemoteError`（`OSError` 子类，`code` 是线协议错误码） |
-| 连接断开、响应畸形 | `SandboxProtocolError` |
+| 操作系统拒绝访问；删除根目录本身；root 守护进程覆盖别人的文件却改不回原属主（没有 `CAP_CHOWN`） | `PermissionError` |
+| 其他（非空目录、读目录当文件、往根目录本身写、路径含 NUL 等） | `SandboxRemoteError`（`OSError` 子类，`code` 是线协议错误码） |
+| 连接断开；响应字段缺失或类型不对 | `SandboxProtocolError` |
+
+原子替换的其他代价（父目录必须可写、断开硬链接、只读文件可被覆盖、单文件 bind mount 得到 `EBUSY`、并发遍历可能看到 `.tmp-*`、不 `fsync`）见 [ADR 0004](../decisions/0004-streaming-processes-and-workspace-fs.md) 决策 8。
 
 ## 异常
 

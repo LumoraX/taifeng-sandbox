@@ -2,7 +2,7 @@
 
 [taifeng](https://github.com/LumoraX/taifeng) 的执行隔离适配层：把 taifeng 定义的执行类协议接到本机隔离、容器与远端沙盒。
 
-> **状态**：第一版。本机隔离（macOS seatbelt、Linux bubblewrap）与 Docker 后端可用；K8s 与云沙盒适配未开始。
+> **状态**：第一版（尚未发布）。本机隔离（macOS seatbelt、Linux bubblewrap）与 Docker 后端可用，都支持持续读写的流式进程（可经执行器起 MCP server）；经守护进程的文件访问实现 taifeng `WorkspaceFS`。K8s 与云沙盒适配未开始。
 
 ## 定位
 
@@ -99,7 +99,7 @@ executor = DaemonCommandExecutor(client)           # 实现 taifeng.CommandExecu
 workspace = DaemonWorkspace(client)                # 实现 taifeng.WorkspaceFS；交给文件类工具的 workspace=
 ```
 
-线协议见 [ADR 0003](docs/decisions/0003-protocol-v1-and-trust-boundaries.md)。
+线协议（第 2 版）见 [protocol.md](docs/architecture/protocol.md)，设计取舍见 [ADR 0003](docs/decisions/0003-protocol-v1-and-trust-boundaries.md)、[ADR 0004](docs/decisions/0004-streaming-processes-and-workspace-fs.md)。
 
 ### 异常
 
@@ -129,7 +129,7 @@ workspace = DaemonWorkspace(client)                # 实现 taifeng.WorkspaceFS�
 | [接口参考](docs/architecture/reference.md) | 隔离策略的字段与预设、各执行器的行为、容器配置的全部字段、守护进程客户端、异常 |
 | [线协议](docs/architecture/protocol.md) | 宿主与沙盒内守护进程之间的协议：给别的环境写客户端、或换一种语言实现守护进程时用 |
 | [架构总览](docs/architecture/README.md) | 分层、信任边界、已知限制 |
-| [决策记录](docs/decisions/README.md) | 分层取舍见 [ADR 0002](docs/decisions/0002-in-sandbox-daemon.md)、[ADR 0003](docs/decisions/0003-protocol-v1-and-trust-boundaries.md) |
+| [决策记录](docs/decisions/README.md) | 分层取舍见 [ADR 0002](docs/decisions/0002-in-sandbox-daemon.md)、[ADR 0003](docs/decisions/0003-protocol-v1-and-trust-boundaries.md)；流式进程与工作区文件协议见 [ADR 0004](docs/decisions/0004-streaming-processes-and-workspace-fs.md) |
 
 ## 开发
 
