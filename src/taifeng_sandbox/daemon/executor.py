@@ -55,7 +55,12 @@ class _Buffer:
 
 
 class RemoteProcess:
-    """守护进程里一个进程的宿主侧句柄，满足 taifeng ``CommandProcess`` 协议。"""
+    """守护进程里一个进程的宿主侧句柄，满足 taifeng ``CommandProcess`` 协议。
+
+    输出一次性收齐：每路按 ``max_buffer_bytes`` 保留，超出丢弃并计数。子类经两个钩子改变
+    输出的去向——``_deliver`` 接收每一块输出，``_on_finished`` 在进程结束（退出或连接断开）
+    时调用一次；登记、强杀、退出码的处理都在这里，子类不必重复。
+    """
 
     def __init__(
         self,
@@ -67,6 +72,7 @@ class RemoteProcess:
         """在发起启动请求之前构造并登记通知处理函数，避免漏掉最早的输出。"""
         self._client = client
         self._process_id = process_id
+        self._max_buffer_bytes = max_buffer_bytes
         self._stdout = _Buffer(max_buffer_bytes)
         self._stderr = _Buffer(max_buffer_bytes)
         self._returncode: int | None = None
@@ -93,13 +99,17 @@ class RemoteProcess:
         return self._stdout.dropped + self._stderr.dropped
 
     def _on_output(self, params: dict[str, Any]) -> None:
-        """收到一块输出。"""
+        """收到一块输出：解码后交给 ``_deliver``。"""
         try:
             chunk = base64.b64decode(str(params.get("data", "")), validate=True)
         except (binascii.Error, ValueError):
             logger.warning("进程 %s 的输出块不是合法 base64，已丢弃", self._process_id)
             return
-        target = self._stderr if params.get("stream") == "stderr" else self._stdout
+        self._deliver("stderr" if params.get("stream") == "stderr" else "stdout", chunk)
+
+    def _deliver(self, stream: str, chunk: bytes) -> None:
+        """处理一块输出（``stream`` 为 ``"stdout"`` 或 ``"stderr"``）：放进有上限的缓冲。"""
+        target = self._stderr if stream == "stderr" else self._stdout
         target.append(chunk)
 
     def _on_exited(self, params: dict[str, Any]) -> None:
@@ -113,10 +123,15 @@ class RemoteProcess:
             self._finish(_LOST_EXIT_CODE)
 
     def _finish(self, code: int) -> None:
-        """记录退出码并释放登记。"""
+        """记录退出码、调结束钩子，再唤醒等待者并释放登记。"""
         self._returncode = code
+        # 先收尾再唤醒：wait() 返回时各路输出已经结束
+        self._on_finished()
         self._exited.set()
         self.abandon()
+
+    def _on_finished(self) -> None:
+        """进程结束（退出或连接断开）时调用一次。一次性收输出无需额外收尾。"""
 
     def abandon(self) -> None:
         """撤销通知登记（进程结束或启动失败时调用）。"""
@@ -176,29 +191,42 @@ class DaemonCommandExecutor:
             client: 已握手的守护进程连接。
             default_cwd: ``CommandSpec.cwd`` 为 None 时使用的工作目录；仍为 None 则用
                 守护进程的根目录。
-            max_buffer_bytes: 每路输出在宿主侧保留的字节上限。
+            max_buffer_bytes: 一次性收输出的进程：每路输出在宿主侧保留的字节上限，超出丢弃
+                并计数。流式进程（``CommandSpec.stdin=True``）：每路**未读**字节的上限，超出
+                就杀掉进程、让读取方拿到 ``SandboxError``。
         """
         self._client = client
         self._default_cwd = default_cwd
         self._max_buffer_bytes = max_buffer_bytes
 
     async def start(self, spec: CommandSpec) -> CommandProcess:
-        """启动进程并立即返回。启动失败抛 ``OSError``（含子类）。"""
+        """启动进程并立即返回。启动失败抛 ``OSError``（含子类）。
+
+        ``spec.stdin`` 为真时返回 ``StreamingRemoteProcess``（满足 ``StreamingCommandProcess``），
+        否则返回一次性收输出的 ``RemoteProcess``。
+        """
         process_id = "p_" + secrets.token_hex(8)
-        process = RemoteProcess(
-            self._client, process_id, max_buffer_bytes=self._max_buffer_bytes
-        )
-        cwd = spec.cwd if spec.cwd is not None else self._default_cwd
-        try:
-            result = await self._client.request(
-                protocol.METHOD_PROCESS_START,
-                {
-                    "processId": process_id,
-                    "argv": command_argv(spec),
-                    "cwd": cwd,
-                    "env": dict(spec.env),
-                },
+        params: dict[str, Any] = {
+            "processId": process_id,
+            "argv": command_argv(spec),
+            "cwd": spec.cwd if spec.cwd is not None else self._default_cwd,
+            "env": dict(spec.env),
+        }
+        process: RemoteProcess
+        if spec.stdin:
+            # streaming 模块继承本模块的 RemoteProcess，放到顶层导入会成环
+            from taifeng_sandbox.daemon.streaming import StreamingRemoteProcess
+
+            process = StreamingRemoteProcess(
+                self._client, process_id, max_buffer_bytes=self._max_buffer_bytes
             )
+            params["stdin"] = True
+        else:
+            process = RemoteProcess(
+                self._client, process_id, max_buffer_bytes=self._max_buffer_bytes
+            )
+        try:
+            result = await self._client.request(protocol.METHOD_PROCESS_START, params)
         except SandboxRemoteError as exc:
             process.abandon()
             _raise_spawn_error(exc)

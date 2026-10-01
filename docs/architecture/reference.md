@@ -121,6 +121,7 @@ async with await DockerEnvironment.create(config) as sandbox:
 | `client.close()` | 发 `shutdown` 并关闭 |
 | `DaemonCommandExecutor(client, default_cwd=None, max_buffer_bytes=16 MiB)` | 实现 `CommandExecutor`。每路输出在宿主侧最多保留 `max_buffer_bytes`，超出丢弃并计数 |
 | `RemoteProcess` | `DaemonCommandExecutor.start` 返回的进程句柄，实现 `CommandProcess` |
+| `StreamingRemoteProcess` | `CommandSpec.stdin=True` 时 `DaemonCommandExecutor.start` 返回的进程句柄，实现 `StreamingCommandProcess`（内核 `McpStdioClient` 经执行器起 MCP server 要用）：`stdin` 写入经 `process/write`，`drain` 等守护进程回复；`close` 立即返回，后台发完缓冲再发 `process/closeStdin`；`communicate` 先关标准输入。进程结束或连接断开时 `stdout` / `stderr` 读到 EOF，`drain` 抛 `BrokenPipeError`。`max_buffer_bytes` 在这里是每路未读字节的上限，超过就杀掉进程，读取方拿到 `SandboxError` |
 
 ### `DaemonWorkspace(client)`
 
