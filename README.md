@@ -129,7 +129,7 @@ workspace = DaemonWorkspace(client)                # 实现 taifeng.WorkspaceFS�
 | [接口参考](docs/architecture/reference.md) | 隔离策略的字段与预设、各执行器的行为、容器配置的全部字段、守护进程客户端、异常 |
 | [线协议](docs/architecture/protocol.md) | 宿主与沙盒内守护进程之间的协议：给别的环境写客户端、或换一种语言实现守护进程时用 |
 | [架构总览](docs/architecture/README.md) | 分层、信任边界、已知限制 |
-| [决策记录](docs/decisions/README.md) | 分层取舍见 [ADR 0002](docs/decisions/0002-in-sandbox-daemon.md)、[ADR 0003](docs/decisions/0003-protocol-v1-and-trust-boundaries.md)；流式进程与工作区文件协议见 [ADR 0004](docs/decisions/0004-streaming-processes-and-workspace-fs.md) |
+| [决策记录](docs/decisions/README.md) | 分层取舍见 [ADR 0002](docs/decisions/0002-in-sandbox-daemon.md)、[ADR 0003](docs/decisions/0003-protocol-v1-and-trust-boundaries.md)；流式进程与工作区文件协议见 [ADR 0004](docs/decisions/0004-streaming-processes-and-workspace-fs.md)；本机后端收紧见 [ADR 0005](docs/decisions/0005-local-launcher-and-seatbelt-hardening.md) |
 
 ## 开发
 
@@ -140,7 +140,7 @@ uv run ruff check --select F,S108,I,TC src tests
 uv run mypy src/
 ```
 
-各组测试的前提：seatbelt 用例要 macOS；bubblewrap 用例要 Linux、装了 `bubblewrap` 且允许创建用户命名空间；Docker 用例要本机有可用的 Docker 守护进程。
+各组测试的前提：seatbelt 用例要 macOS；bubblewrap 用例要 Linux、装了 `bubblewrap` 且允许创建用户命名空间；Docker 用例要本机有可用的 Docker 守护进程。在 macOS 上用 Docker 跑 bubblewrap 用例的命令见 [架构总览 · 验证](docs/architecture/README.md#验证)。
 
 ## 许可
 

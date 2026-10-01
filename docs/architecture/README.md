@@ -59,6 +59,8 @@ taifeng 工具层（审批 / 黑名单 / env 白名单 / 超时 / 截断 / 取�
 
 环境变量在每一层都是「给什么用什么」：执行器把 `CommandSpec.env` 当作完整环境，不叠加宿主环境；守护进程同样不把自己的环境传给子进程。
 
+本机后端的启动器（沙盒外的 `bwrap` 进程）本身不受被隔离一方影响：它只拿固定的空环境、工作目录固定为 `/`；`CommandSpec.env` 经 `--args` 读取的封口 memfd 以 `--setenv` 交给 bwrap，只在沙盒里的目标进程上生效，值也不进命令行（[ADR 0005](../decisions/0005-local-launcher-and-seatbelt-hardening.md) 决策 1）。
+
 ## 组件状态
 
 | 组件 | extra | 状态 | 验证方式 |
@@ -70,10 +72,35 @@ taifeng 工具层（审批 / 黑名单 / env 白名单 / 超时 / 截断 / 取�
 | K8s 后端 | `k8s` | 未开始 | — |
 | E2B / Daytona 适配 | `e2b` / `daytona` | 未开始 | — |
 
+## 验证
+
+本机与 Linux 各跑一遍：seatbelt 用例只在 macOS 上跑，bubblewrap 用例只在 Linux 上跑。
+
+```bash
+# 本机（macOS 上覆盖 seatbelt；Linux 上覆盖 bubblewrap）
+uv run pytest -q
+
+# 在 macOS 上用 Docker 起一个 Linux 容器跑本机后端用例（bubblewrap 要 --privileged 才能建命名空间）。
+# 仓库以只读方式挂进去，虚拟环境、uv 缓存与字节码都放在容器的 /tmp，不污染宿主仓库；
+# 开发期 taifeng 是同级目录的路径依赖，所以一并挂载。gcc 用来编测试用的 LD_PRELOAD 库。
+docker run --rm --privileged \
+  -v "$PWD":/src/taifeng-sandbox:ro -v "$PWD/../taifeng":/src/taifeng:ro \
+  -e UV_PROJECT_ENVIRONMENT=/tmp/venv -e UV_CACHE_DIR=/tmp/uv-cache \
+  -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPYCACHEPREFIX=/tmp/pycache \
+  -w /src/taifeng-sandbox python:3.12-slim bash -c '
+    apt-get update -qq && apt-get install -y -qq bubblewrap gcc libc6-dev >/dev/null &&
+    pip install -q uv &&
+    uv run --frozen --extra dev pytest tests/local -q -p no:cacheprovider'
+```
+
+容器里 seatbelt 用例全部跳过，bubblewrap 用例全部要跑到（没有跳过）。
+
 ## 已知限制
 
 - 经守护进程执行时，`CommandSpec.stdin=False` 的命令在进程结束后一次性取回输出；`stdin=True` 时是流式的（标准输入持续写、输出边到边读，见 [`StreamingRemoteProcess`](reference.md#streamingremoteprocess)），每路未读输出有上限，超限强杀进程并报错。
 - bubblewrap 后端只用命名空间与挂载，没有叠加 seccomp、Landlock。
+- 同一用户的其他进程能读到沙盒里目标进程的环境（`/proc/<pid>/environ`），与不隔离执行相同；需要对同用户隐藏密钥时，换用独立用户或容器后端。
+- bubblewrap 后端 `CommandSpec.cwd=None` 时取宿主进程当前目录，沙盒里看不到它就启动失败（bwrap 报错退出）。
 - seatbelt 的受限读模式允许对任意路径取元数据（不含内容与目录列表），否则进程无法沿父目录打开深层文件。
 - 出网只有开、关两档，没有域名白名单与出网代理。
 - 容器后端要求镜像里有 Python 3.9+。

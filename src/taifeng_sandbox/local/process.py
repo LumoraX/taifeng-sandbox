@@ -13,7 +13,7 @@ import signal
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Collection, Mapping, Sequence
 
     import taifeng
 
@@ -95,6 +95,7 @@ async def spawn_group(
     cwd: str | None,
     env: Mapping[str, str],
     stdin: bool = False,
+    pass_fds: Collection[int] = (),
 ) -> ProcessGroup:
     """以新会话启动子进程，stdout / stderr 走管道。
 
@@ -102,6 +103,7 @@ async def spawn_group(
     ``STREAM_LIMIT_BYTES``。
 
     ``env`` 作为完整环境传入，不叠加宿主环境变量（taifeng ``CommandExecutor`` 契约）。
+    ``pass_fds`` 里的 fd 以相同编号留给子进程，其余 fd 一律关闭。
     启动失败抛 ``OSError``，由 taifeng 工具层转成 ``spawn_error``。
     """
     proc = await asyncio.create_subprocess_exec(
@@ -112,6 +114,7 @@ async def spawn_group(
         cwd=cwd,
         env=dict(env),
         close_fds=True,
+        pass_fds=tuple(pass_fds),
         start_new_session=True,
         limit=STREAM_LIMIT_BYTES,
     )

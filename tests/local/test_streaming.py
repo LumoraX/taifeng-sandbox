@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import shlex
 import sys
 from typing import TYPE_CHECKING
 
@@ -21,6 +22,9 @@ pytestmark = pytest.mark.skipif(
     sys.platform not in ("darwin", "linux"), reason="只在有本机隔离后端的平台上跑"
 )
 
+# 用跑测试的解释器：系统里不一定有 /usr/bin/python3（如 python:3.12-slim 镜像只有 /usr/local/bin）
+PYTHON = shlex.quote(sys.executable)
+
 ECHO = "import sys\nfor line in sys.stdin:\n    sys.stdout.write('got:' + line)\n    sys.stdout.flush()\n"
 
 
@@ -31,7 +35,7 @@ async def test_stdin_and_stdout_stream(tmp_path: Path) -> None:
     executor = create_local_executor(SandboxPolicy.workspace_write(tmp_path))
     proc = await executor.start(
         taifeng.CommandSpec(
-            command=f"/usr/bin/env python3 {script}", shell=False, cwd=str(tmp_path),
+            command=f"{PYTHON} {script}", shell=False, cwd=str(tmp_path),
             env={"PATH": "/usr/bin:/bin"}, stdin=True,
         )
     )
@@ -61,7 +65,7 @@ async def test_readline_reads_a_line_longer_than_the_asyncio_default(tmp_path: P
     executor = create_local_executor(SandboxPolicy.workspace_write(tmp_path))
     proc = await executor.start(
         taifeng.CommandSpec(
-            command=f"/usr/bin/env python3 {script}", shell=False, cwd=str(tmp_path),
+            command=f"{PYTHON} {script}", shell=False, cwd=str(tmp_path),
             env={"PATH": "/usr/bin:/bin"}, stdin=True,
         )
     )

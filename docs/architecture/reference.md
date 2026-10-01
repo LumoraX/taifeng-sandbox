@@ -36,7 +36,8 @@
 
 | 行为 | 说明 |
 | --- | --- |
-| 环境变量 | `CommandSpec.env` 就是进程的完整环境，不叠加宿主环境 |
+| 环境变量 | `CommandSpec.env` 就是进程的完整环境，不叠加宿主环境。bubblewrap 后端：沙盒外的 `bwrap` 启动器只拿空环境，`env` 经 `--args` 读取的封口 memfd 以 `--setenv` 在沙盒里设置（沙盒里另有 bwrap 设的 `PWD`）；变量名为空、含 `=` 或 NUL，值含 NUL，启动前抛 `SandboxError` |
+| 工作目录 | `CommandSpec.cwd`。bubblewrap 后端：启动器固定在 `/`，沙盒里的目录经 `--chdir` 给出，`cwd=None` 时取宿主进程当前目录，沙盒里看不到它就启动失败 |
 | 进程组 | 以新会话启动；`kill()` 作用于整个进程组，shell 派生的子进程一起终止 |
 | 输出 | `communicate()` 读完两路输出并等退出；`CommandSpec.stdin=True` 时还可经 `stdin` / `stdout` / `stderr` 三个流持续读写（实现 `StreamingCommandProcess`）。`readline()` 的单行上限是 16 MiB（与 `DaemonCommandExecutor` 的 `max_buffer_bytes` 默认值一致；asyncio 默认只有 64 KiB），MCP server 的单条大响应能整行读出 |
 | 资源限制 | 不限制内存与 CPU。需要的话用容器后端 |

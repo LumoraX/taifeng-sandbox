@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import fcntl
+import os
 import shlex
 import sys
 from dataclasses import replace
@@ -140,15 +142,65 @@ class BwrapCommandExecutor:
         return self._policy
 
     async def start(self, spec: CommandSpec) -> CommandProcess:
-        """把命令包进 ``bwrap`` 后启动。"""
-        argv = bwrap.build_argv(
-            self._policy,
-            command_argv(spec),
-            bwrap=self._bwrap,
-            cwd=spec.cwd,
-            unreadable_files=self._unreadable_files,
+        """把命令包进 ``bwrap`` 后启动（ADR 0005 决策 1）。
+
+        沙盒外的 bwrap 启动器只拿固定的空环境（``bwrap.LAUNCHER_ENV``），工作目录固定为
+        ``/``：``spec.env`` 里的 ``LD_PRELOAD`` 之类影响不到它。``spec.env`` 写成
+        ``--setenv`` 放进一个封口的 memfd，经 ``--args`` 交给 bwrap，只在沙盒里的目标进程上
+        生效；值不进命令行（``/proc/<pid>/cmdline`` 对所有用户可读）。沙盒里的工作目录经
+        ``--chdir`` 给出：``spec.cwd``，为 None 时取宿主进程的当前目录（与不隔离执行一致），
+        沙盒里看不到它时 bwrap 报错退出。
+        """
+        command = command_argv(spec)
+        encoded_env = bwrap.encode_args(bwrap.env_args(spec.env))
+        cwd = spec.cwd if spec.cwd is not None else os.getcwd()
+        args_fd = _sealed_memfd(encoded_env)
+        try:
+            argv = bwrap.build_argv(
+                self._policy,
+                command,
+                bwrap=self._bwrap,
+                cwd=cwd,
+                unreadable_files=self._unreadable_files,
+                args_fd=args_fd,
+            )
+            return await spawn_group(
+                argv,
+                cwd=bwrap.LAUNCHER_CWD,
+                env=bwrap.LAUNCHER_ENV,
+                stdin=spec.stdin,
+                pass_fds=(args_fd,),
+            )
+        finally:
+            # 子进程已继承自己的一份；bwrap 读完即关
+            os.close(args_fd)
+
+
+def _sealed_memfd(data: bytes) -> int:
+    """把 ``data`` 写进一个匿名内存文件并封口，返回读位置在开头的 fd（带 close-on-exec）。
+
+    不用管道：内容超过管道缓冲（默认 64 KiB）时，在 bwrap 开始读之前写入就会阻塞。不落盘：
+    内容常含密钥。封口（禁止写入、增长、收缩）之后，即使有人经 ``/proc/<pid>/fd``
+    打开它，也改不了 bwrap 将要读到的参数。
+    """
+    # 这里直接判断 sys.platform：memfd 与封口常量只在 Linux 的类型存根里，需要让类型检查器收窄
+    if sys.platform != "linux":
+        raise SandboxUnavailableError("memfd 只在 Linux 上可用")
+    fd = os.memfd_create("taifeng-sandbox-bwrap-args", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view) :]
+        fcntl.fcntl(
+            fd,
+            fcntl.F_ADD_SEALS,
+            fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE,
         )
-        return await spawn_group(argv, cwd=spec.cwd, env=spec.env, stdin=spec.stdin)
+        os.lseek(fd, 0, os.SEEK_SET)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 def create_local_executor(policy: SandboxPolicy) -> CommandExecutor:

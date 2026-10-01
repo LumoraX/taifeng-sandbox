@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from taifeng_sandbox import SandboxPolicy
+from taifeng_sandbox import SandboxError, SandboxPolicy
 from taifeng_sandbox.local import bwrap
 
 
@@ -77,3 +77,46 @@ def test_empty_command_rejected() -> None:
     """空命令直接拒绝。"""
     with pytest.raises(ValueError, match="command"):
         bwrap.build_argv(SandboxPolicy(), [], bwrap="bwrap")
+
+
+def test_launcher_env_and_cwd_are_fixed() -> None:
+    """沙盒外的 bwrap 启动器只用固定的空环境、固定的工作目录 ``/``。"""
+    assert dict(bwrap.LAUNCHER_ENV) == {}
+    assert bwrap.LAUNCHER_CWD == "/"
+
+
+def test_env_becomes_setenv_args_in_order() -> None:
+    """目标进程的环境逐个变成 ``--setenv 名 值``，保持顺序，值原样保留。"""
+    env = {"PATH": "/usr/bin", "LD_PRELOAD": "/x.so", "ODD": "--bind / / =\n"}
+    assert bwrap.env_args(env) == [
+        "--setenv", "PATH", "/usr/bin",
+        "--setenv", "LD_PRELOAD", "/x.so",
+        "--setenv", "ODD", "--bind / / =\n",
+    ]
+
+
+def test_args_file_is_nul_terminated() -> None:
+    """``--args`` 读取的内容：每个参数以 NUL 结尾。"""
+    assert bwrap.encode_args(["--setenv", "A", ""]) == b"--setenv\0A\0\0"
+    assert bwrap.encode_args([]) == b""
+
+
+@pytest.mark.parametrize(
+    ("name", "value"), [("", "x"), ("A=B", "x"), ("A\0", "x"), ("A", "x\0y")]
+)
+def test_invalid_env_rejected(name: str, value: str) -> None:
+    """变量名为空、含 ``=`` 或 NUL，值含 NUL：启动前就拒绝（OSError 子类）。"""
+    with pytest.raises(SandboxError, match="环境变量"):
+        bwrap.env_args({name: value})
+
+
+def test_args_fd_goes_before_command_and_env_stays_out_of_argv() -> None:
+    """``--args FD`` 排在 ``--`` 之前；环境的值不出现在命令行里。"""
+    argv = bwrap.build_argv(
+        SandboxPolicy(), ["/bin/true"], bwrap="bwrap", cwd="/work", args_fd=7
+    )
+    at = argv.index("--args")
+    assert argv[at + 1] == "7"
+    assert at < argv.index("--")
+    assert "--setenv" not in argv
+    assert "--clearenv" not in argv
