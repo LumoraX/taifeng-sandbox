@@ -309,7 +309,10 @@ class ProcessService:
         self._guard = guard
         self._notify = notify
         self._processes = {}  # type: Dict[str, asyncio.subprocess.Process]
+        # 要了标准输入的进程各有一把写锁，与进程同进同出进程表
+        self._stdin_locks = {}  # type: Dict[str, asyncio.Lock]
         self._watchers = set()  # type: set[asyncio.Future[None]]
+        self._stdin_reapers = set()  # type: set[asyncio.Future[None]]
 
     async def start(self, params: Params) -> Dict[str, Any]:
         """启动进程。以新会话启动，强杀时连同其子进程一起终止。
@@ -325,6 +328,9 @@ class ProcessService:
         if process_id in self._processes:
             raise RpcError(ERROR_PROCESS_EXISTS, "processId 已存在：%s" % process_id)
         try:
+            # Python 3.9 的 asyncio 给子进程 stdin 用的是 Unix socketpair 而不是管道（3.12 起
+            # 只在 AIX 上这样）：写、关、对端断开的行为一致，只是缓冲大小不同（macOS 上
+            # socketpair 8 KiB、管道 64 KiB），背压来得更早
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.PIPE if wants_stdin else asyncio.subprocess.DEVNULL,
@@ -340,6 +346,8 @@ class ProcessService:
         except OSError as exc:
             raise RpcError(ERROR_SPAWN_FAILED, str(exc)) from exc
         self._processes[process_id] = proc
+        if wants_stdin:
+            self._stdin_locks[process_id] = asyncio.Lock()
         watcher = asyncio.ensure_future(self._watch(process_id, proc))
         self._watchers.add(watcher)
         watcher.add_done_callback(self._watchers.discard)
@@ -391,23 +399,39 @@ class ProcessService:
         finally:
             if self._processes.get(process_id) is proc:
                 del self._processes[process_id]
+                self._stdin_locks.pop(process_id, None)
+            if proc.stdin is not None:
+                self._release_stdin(process_id, proc.stdin)
         await self._notify("process/exited", {"processId": process_id, "exitCode": exit_code})
 
-    def _stdin_of(self, process_id: str) -> Optional[asyncio.StreamWriter]:
-        """取进程的标准输入（没要时为 ``None``）；进程不在表里是 ``ERROR_PROCESS_UNKNOWN``。"""
+    def _release_stdin(self, process_id: str, stdin: asyncio.StreamWriter) -> None:
+        """进程收尾：关掉标准输入（已关则无事），在后台取走关闭结果。
+
+        关闭结果统一在这里取，不管宿主有没有发过 ``process/closeStdin``：对端断开时关闭结果
+        带着异常，没人取的话 Python 3.9 会在回收时打出「Future exception was never retrieved」。
+        后台取而不是就地等：进程派生的子进程可能还占着标准输入却不读，等关闭会挂住退出通知。
+        """
+        stdin.close()
+        reaper = asyncio.ensure_future(_await_stdin_closed(process_id, stdin))
+        self._stdin_reapers.add(reaper)
+        reaper.add_done_callback(self._stdin_reapers.discard)
+
+    def _known(self, process_id: str) -> asyncio.subprocess.Process:
+        """取进程表里的进程；不在表里是 ``ERROR_PROCESS_UNKNOWN``。"""
         proc = self._processes.get(process_id)
         if proc is None:
             raise RpcError(ERROR_PROCESS_UNKNOWN, "没有这个进程：%s" % process_id)
-        return proc.stdin
+        return proc
 
     async def write(self, params: Params) -> Dict[str, Any]:
-        """向进程的标准输入写一段数据，等管道接收（``drain``）之后才回复。
+        """向进程的标准输入写一段数据，等写缓冲回落到水位线以下（``drain``）才回复。
 
-        写入顺序由宿主保证：每次写都等到响应才发下一次。守护进程为每条请求各起一个任务，
-        所以并发发出的两次写不保证顺序。
+        回复是背压信号，不代表进程已经读到。启动时没要标准输入的进程不能写
+        （``ERROR_INVALID_PARAMS``），不静默丢弃；标准输入已关闭或对端已断开时是 ``ERROR_IO``。
 
-        启动时没要标准输入的进程不能写（``ERROR_INVALID_PARAMS``），不静默丢弃；标准输入已关闭、
-        或进程那头已断开时是 ``ERROR_IO``。
+        写入顺序由宿主保证：每次写都等到响应才发下一次。守护进程为每条请求各起一个任务；
+        每个进程一把写锁，保证并发到达的写按到达顺序整块落入管道，也避免 Python 3.9 上并发
+        ``drain`` 的 AssertionError 掩盖已经写进缓冲的数据。宿主仍应串行写。
         """
         process_id = _require_str(params, "processId")
         try:
@@ -416,36 +440,34 @@ class ProcessService:
             raise RpcError(ERROR_INVALID_PARAMS, "data 不是合法的 base64") from exc
         if len(data) > MAX_FILE_BYTES:
             raise RpcError(ERROR_TOO_LARGE, "单次写入超过上限")
-        stdin = self._stdin_of(process_id)
-        if stdin is None:
+        stdin = self._known(process_id).stdin
+        lock = self._stdin_locks.get(process_id)
+        if stdin is None or lock is None:
             raise RpcError(ERROR_INVALID_PARAMS, "进程启动时没有要标准输入：%s" % process_id)
-        # 关闭中的管道会把写入静默丢掉，必须先拦下
-        if stdin.is_closing():
-            raise RpcError(ERROR_IO, "进程的标准输入已关闭：%s" % process_id)
-        try:
-            stdin.write(data)
-            await stdin.drain()
-        except (BrokenPipeError, ConnectionResetError) as exc:
-            raise RpcError(ERROR_IO, "进程的标准输入已断开：%s" % process_id) from exc
+        async with lock:
+            # 关闭中的管道会把写入静默丢掉，必须先拦下
+            if stdin.is_closing():
+                raise RpcError(ERROR_IO, "进程的标准输入已关闭或对端已断开：%s" % process_id)
+            try:
+                stdin.write(data)
+                await stdin.drain()
+            except OSError as exc:
+                raise RpcError(
+                    ERROR_IO, "写进程的标准输入失败：%s：%s" % (process_id, exc)
+                ) from exc
         return {"bytesWritten": len(data)}
 
     async def close_stdin(self, params: Params) -> Dict[str, Any]:
-        """关闭进程的标准输入，进程随后读到 EOF。
+        """发起关闭进程的标准输入，立即回复 ``{}``；进程读完已送达的数据后读到 EOF。
 
-        没要标准输入的进程本来就读得到 EOF，重复关闭也一样，都不算错。回复之前等管道真正关闭
-        （缓冲里剩下的数据写完）；这一步发现进程那头已断开，说明有数据没送到，报 ``ERROR_IO``。
+        关闭是发起式的，与本机管道一致：写缓冲里尚未进管道的数据在后台继续写，进程不读或提前
+        退出时丢弃。不等关闭完成——进程不读时那会一直挂到进程被杀。关闭结果在进程收尾时取走
+        （见 ``_release_stdin``）。没要标准输入的进程本来就读得到 EOF，重复关闭也一样，都不算错。
+        不拿写锁：停在背压上的写持有写锁，拿锁会让关闭排在它后面。
         """
-        process_id = _require_str(params, "processId")
-        stdin = self._stdin_of(process_id)
-        if stdin is None:
-            return {}
-        stdin.close()
-        try:
-            await stdin.wait_closed()
-        except (BrokenPipeError, ConnectionResetError) as exc:
-            raise RpcError(
-                ERROR_IO, "进程的标准输入已断开，有数据没送到：%s" % process_id
-            ) from exc
+        stdin = self._known(_require_str(params, "processId")).stdin
+        if stdin is not None:
+            stdin.close()
         return {}
 
     async def kill(self, params: Params) -> Dict[str, Any]:
@@ -463,6 +485,14 @@ class ProcessService:
             _kill_group(proc)
         if self._watchers:
             await asyncio.wait(list(self._watchers), timeout=5)
+
+
+async def _await_stdin_closed(process_id: str, stdin: asyncio.StreamWriter) -> None:
+    """等标准输入真正关闭并取走结果；出错只往 stderr 写一行诊断——数据已没人可收，宿主也已收尾。"""
+    try:
+        await stdin.wait_closed()
+    except OSError as exc:
+        sys.stderr.write("daemon: 进程 %s 的标准输入关闭时出错：%r\n" % (process_id, exc))
 
 
 def _kill_group(proc: asyncio.subprocess.Process) -> None:
