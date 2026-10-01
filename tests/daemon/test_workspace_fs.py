@@ -340,6 +340,96 @@ async def test_failures_are_standard_os_errors(client: DaemonClient, root: Path)
     assert not (root / "d").exists()
 
 
+async def test_remove_deletes_the_link_not_its_target(
+    client: DaemonClient, root: Path, tmp_path: Path
+) -> None:
+    """删符号链接删的是链接本身（POSIX ``unlink`` / ``rm`` 语义），目标原样留着。
+
+    指向根内文件、指向根外文件（合法：删的是根内的东西）、悬空链接都一样。
+    """
+    (root / "target.txt").write_text("keep")
+    (root / "inner-link").symlink_to(root / "target.txt")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("s3cret")
+    (root / "outer-link").symlink_to(outside)
+    (root / "dangling").symlink_to(root / "nothing-here")
+    ws = DaemonWorkspace(client)
+    for name in ("inner-link", "outer-link", "dangling"):
+        await ws.remove(name)
+        assert not (root / name).is_symlink(), name
+    assert (root / "target.txt").read_text() == "keep"
+    assert outside.read_text() == "s3cret"
+
+
+async def test_kernel_apply_patch_delete_of_a_link_keeps_the_target(
+    client: DaemonClient, root: Path
+) -> None:
+    """经内核 ``apply_patch`` 删一个指向文件的链接：链接没了，目标还在。"""
+    (root / "target.txt").write_text("keep")
+    (root / "link.txt").symlink_to(root / "target.txt")
+    result = await _call(
+        taifeng.make_apply_patch_tool(workspace=DaemonWorkspace(client)),
+        patches=[{"path": "link.txt", "delete": True}],
+    )
+    assert not result.is_error, result.output
+    assert not (root / "link.txt").is_symlink()
+    assert (root / "target.txt").read_text() == "keep"
+
+
+async def test_recursive_remove_of_a_directory_link_keeps_the_target(
+    client: DaemonClient, root: Path, tmp_path: Path
+) -> None:
+    """指向目录的链接加 ``recursive=True``：只删链接，不递归删目标目录（根内、根外都一样）。"""
+    (root / "real-dir").mkdir()
+    (root / "real-dir" / "f.txt").write_text("keep")
+    (root / "dir-link").symlink_to(root / "real-dir")
+    (tmp_path / "outside-dir").mkdir()
+    (tmp_path / "outside-dir" / "secret.txt").write_text("s3cret")
+    (root / "outer-dir-link").symlink_to(tmp_path / "outside-dir")
+    ws = DaemonWorkspace(client)
+    await ws.remove("dir-link", recursive=True)
+    await ws.remove("outer-dir-link", recursive=True)
+    assert sorted(p.name for p in root.iterdir()) == ["real-dir"]
+    assert (root / "real-dir" / "f.txt").read_text() == "keep"
+    assert (tmp_path / "outside-dir" / "secret.txt").read_text() == "s3cret"
+    # 真目录照常按 recursive 处理
+    await ws.remove("real-dir", recursive=True)
+    assert list(root.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("path", "code"),
+    [
+        (".", protocol.ERROR_ACCESS_DENIED),
+        ("{root}", protocol.ERROR_ACCESS_DENIED),
+        ("{root}/", protocol.ERROR_ACCESS_DENIED),
+        ("sub/..", protocol.ERROR_ACCESS_DENIED),
+        ("sub/.", protocol.ERROR_INVALID_PARAMS),
+        ("sub/", protocol.ERROR_INVALID_PARAMS),
+        ("sub/inner/..", protocol.ERROR_INVALID_PARAMS),
+        ("dir-link/", protocol.ERROR_INVALID_PARAMS),
+        ("..", protocol.ERROR_OUTSIDE_ROOT),
+        ("/", protocol.ERROR_OUTSIDE_ROOT),
+    ],
+)
+async def test_remove_rejects_paths_that_name_no_single_entry(
+    client: DaemonClient, root: Path, path: str, code: int
+) -> None:
+    """守护进程自己守：末段为空、``.``、``..`` 的路径不指名单独一个目录项，一律拒绝，什么都不删。
+
+    指向根目录本身按删根拒绝（``-32020``），在根外按越界（``-32024``），其余是参数错误
+    （``-32602``）；以 ``/`` 结尾的链接不会被跟随到目标。
+    """
+    (root / "sub" / "inner").mkdir(parents=True)
+    (root / "dir-link").symlink_to(root / "sub")
+    with pytest.raises(SandboxRemoteError) as caught:
+        await client.request(
+            protocol.METHOD_FS_REMOVE, {"path": path.format(root=root), "recursive": True}
+        )
+    assert caught.value.code == code
+    assert (root / "sub" / "inner").is_dir() and (root / "dir-link").is_symlink()
+
+
 async def test_reading_a_directory_as_a_file_fails(client: DaemonClient, root: Path) -> None:
     """把目录当文件读：是 OSError，但既不是「不存在」也不是「无权」；内核 file_read 报不是文件。"""
     (root / "d").mkdir()

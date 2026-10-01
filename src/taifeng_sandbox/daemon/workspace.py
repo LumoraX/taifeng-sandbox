@@ -190,7 +190,10 @@ class DaemonWorkspace:
         await self._call(protocol.METHOD_FS_CREATE_DIRECTORY, path, recursive=recursive)
 
     async def remove(self, path: str, *, recursive: bool = False) -> None:
-        """删除文件或目录；目录在 ``recursive=False`` 时须为空，根目录本身不允许删。"""
+        """删除文件或目录；目录在 ``recursive=False`` 时须为空，根目录本身不允许删。
+
+        符号链接删的是链接本身，不跟随到目标（指向根外的链接也能删：删的是根内的东西）。
+        """
         await self._call(protocol.METHOD_FS_REMOVE, path, recursive=recursive)
 
 

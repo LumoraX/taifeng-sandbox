@@ -168,7 +168,7 @@ tools = [
 | `list_directory(path)` | 返回 `taifeng.WorkspaceEntry` 列表：`name`、`is_directory`、`is_file`、`is_symlink`（不跟随符号链接判定），按名字排序 |
 | `metadata(path)` | 返回 `taifeng.WorkspaceFileInfo`：`exists`、`is_directory`、`is_file`、`size`、`modified_at`。不存在（含路径中间某一段是文件）时 `exists=False`，不抛异常 |
 | `create_directory(path, recursive=True)` | 建目录（`WorkspaceFS` 之外的附加方法） |
-| `remove(path, recursive=False)` | 删除；目录不给 `recursive` 时须为空，根目录本身不允许删。路径按真实路径解析，**删一个符号链接删掉的是链接目标**，不是链接本身（与内核 `LocalWorkspaceFS` 一致） |
+| `remove(path, recursive=False)` | 删除目录项本身；目录不给 `recursive` 时须为空，根目录本身不允许删。**符号链接删的是链接本身**，不跟随到目标（指向根外的链接也能删，根外目标不动；指向目录的链接加 `recursive=True` 也只删链接）。这一点与内核 `LocalWorkspaceFS`（删到链接目标）不同 |
 
 每个方法都先调 `resolve`，自己校验边界，不依赖调用方先调过它。失败用标准 `OSError` 子类表达：
 

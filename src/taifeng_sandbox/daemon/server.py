@@ -126,17 +126,46 @@ class PathGuard:
     def resolve(self, requested: str) -> str:
         """解析为真实路径并确认没有逃出根目录。
 
-        相对路径相对根目录解释。目标不存在时 ``realpath`` 仍会解析已存在的那部分父目录，
-        所以借符号链接指向根外的写入同样会被拦下。路径里有 NUL 是参数错误：显式检查，因为 3.9 的
-        ``realpath`` 不报错、要到之后打开文件时才抛 ``ValueError``。
+        目标不存在时 ``realpath`` 仍会解析已存在的那部分父目录，借链接指向根外的写入同样被拦下。
+        """
+        real = os.path.realpath(self._candidate(requested))
+        if not self._inside(real):
+            raise RpcError(ERROR_OUTSIDE_ROOT, "路径在沙盒根目录之外：%s" % requested)
+        return real
+
+    def resolve_entry(self, requested: str) -> str:
+        """定位目录项本身（删除用）：父目录按真实路径解析、须在根目录之内，末段不跟随符号链接。
+
+        末段是 ``.``、``..`` 或为空（以 ``/`` 结尾）的路径不指名单独一个目录项，一律拒绝：指的是
+        根目录本身按删根拒绝，在根外按越界，其余是参数错误——与 ``rm`` 拒绝 ``.`` / ``..`` 一致，
+        也免得结尾的 ``/`` 让末段的链接被跟随。
+        """
+        candidate = self._candidate(requested)
+        head, name = os.path.split(candidate)
+        special = name in ("", ".", "..")
+        # 末段特殊时整条路径解析成真实路径，只为给出准确的拒绝理由
+        parent = os.path.realpath(candidate if special else head)
+        entry = parent if special else os.path.join(parent, name)
+        if entry == self.root:
+            raise RpcError(ERROR_ACCESS_DENIED, "不允许删除沙盒根目录")
+        if not self._inside(parent):
+            raise RpcError(ERROR_OUTSIDE_ROOT, "路径在沙盒根目录之外：%s" % requested)
+        if special:
+            raise RpcError(ERROR_INVALID_PARAMS, "删除路径的末段不能是空、. 或 ..：%s" % requested)
+        return entry
+
+    def _candidate(self, requested: str) -> str:
+        """拼出待解析的路径（相对路径相对根目录）。
+
+        NUL 是参数错误。显式检查：3.9 的 ``realpath`` 不报错，要到打开文件时才抛 ``ValueError``。
         """
         if "\x00" in requested:
             raise RpcError(ERROR_INVALID_PARAMS, "路径里不能有 NUL 字符：%r" % requested)
-        candidate = requested if os.path.isabs(requested) else os.path.join(self.root, requested)
-        real = os.path.realpath(candidate)
-        if real != self.root and not real.startswith(self.root.rstrip(os.sep) + os.sep):
-            raise RpcError(ERROR_OUTSIDE_ROOT, "路径在沙盒根目录之外：%s" % requested)
-        return real
+        return requested if os.path.isabs(requested) else os.path.join(self.root, requested)
+
+    def _inside(self, real: str) -> bool:
+        """真实路径是否是根目录或在它之下（同前缀的兄弟目录不算）。"""
+        return real == self.root or real.startswith(self.root.rstrip(os.sep) + os.sep)
 
 
 def _map_os_error(exc: OSError, path: str) -> RpcError:
@@ -324,20 +353,20 @@ class FileService:
         return {}
 
     async def remove(self, params: Params) -> Dict[str, Any]:
-        """删除文件或目录；根目录本身不允许删。"""
-        path = self._guard.resolve(_require_str(params, "path"))
-        if path == self._guard.root:
-            raise RpcError(ERROR_ACCESS_DENIED, "不允许删除沙盒根目录")
+        """删除目录项本身（``resolve_entry``）：符号链接删的是链接，不跟随到目标；根目录本身不允许删。
+
+        只有末段是真目录时才按 ``recursive`` 递归或要求为空；``rmtree`` 不跟随目录里的链接。
+        """
+        path = self._guard.resolve_entry(_require_str(params, "path"))
         recursive = _optional_bool(params, "recursive")
 
         def _remove() -> None:
-            if os.path.isdir(path) and not os.path.islink(path):
-                if recursive:
-                    shutil.rmtree(path)
-                else:
-                    os.rmdir(path)
+            if not stat.S_ISDIR(os.lstat(path).st_mode):
+                os.unlink(path)
+            elif recursive:
+                shutil.rmtree(path)
             else:
-                os.remove(path)
+                os.rmdir(path)
 
         try:
             await asyncio.get_event_loop().run_in_executor(None, _remove)
