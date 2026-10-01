@@ -89,7 +89,7 @@ transport = await StdioTransport.spawn(
     ["docker", "exec", "-i", container_id, "python3", "-c", daemon_source(), "--root", "/work"]
 )
 client = await DaemonClient.connect(transport)     # 握手并核对协议版本（PROTOCOL_VERSION）
-executor = DaemonCommandExecutor(client)           # 实现 taifeng.CommandExecutor，返回 RemoteProcess
+executor = DaemonCommandExecutor(client)           # 实现 taifeng.CommandExecutor；stdin=True 时返回流式进程
 workspace = DaemonWorkspace(client)                # 文件访问，返回 FileMetadata / DirectoryEntry
 ```
 

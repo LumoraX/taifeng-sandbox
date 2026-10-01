@@ -38,7 +38,7 @@
 | --- | --- |
 | 环境变量 | `CommandSpec.env` 就是进程的完整环境，不叠加宿主环境 |
 | 进程组 | 以新会话启动；`kill()` 作用于整个进程组，shell 派生的子进程一起终止 |
-| 输出 | 进程结束后一次性取回，不是流式 |
+| 输出 | `communicate()` 读完两路输出并等退出；`CommandSpec.stdin=True` 时还可经 `stdin` / `stdout` / `stderr` 三个流持续读写（实现 `StreamingCommandProcess`） |
 | 资源限制 | 不限制内存与 CPU。需要的话用容器后端 |
 
 两个后端对同一份策略的翻译：
@@ -111,17 +111,35 @@ async with await DockerEnvironment.create(config) as sandbox:
 
 | 接口 | 说明 |
 | --- | --- |
-| `PROTOCOL_VERSION` | 本包使用的线协议版本，当前为 `1` |
+| `PROTOCOL_VERSION` | 本包使用的线协议版本，当前为 `2` |
 | `daemon_source()` | 守护进程的源码文本。单文件、只用标准库、兼容 Python 3.9+ |
 | `StdioTransport.spawn(argv, env=None, cwd=None)` | 启动一个子进程，把它的标准输入输出当作连接。`env=None` 是空环境 |
 | `Transport` | 传输的协议：`send(line)`、`receive()`、`close()`、`diagnostics()`。自己实现它就能走别的通道 |
 | `DaemonClient.connect(transport, client_name=…, request_timeout_seconds=30)` | 握手并返回客户端。握手失败会关闭传输 |
-| `client.request(method, params)` | 发请求。守护进程返回错误时抛 `SandboxRemoteError`，连接断开抛 `SandboxProtocolError` |
+| `client.request(method, params, timeout_seconds=None, no_timeout=False)` | 发请求。守护进程返回错误时抛 `SandboxRemoteError`；连接断开、等响应超时抛 `SandboxProtocolError`。`timeout_seconds` 为 `None` 用连接的默认时限；`no_timeout=True` 不限时等，只给 `process/write` 这类以背压为语义的请求用（连接断开照样结束，时限由调用方取消），两者不能同时给 |
 | `client.server_info` | 握手时守护进程上报的信息 |
 | `client.close()` | 发 `shutdown` 并关闭 |
-| `DaemonCommandExecutor(client, default_cwd=None, max_buffer_bytes=16 MiB)` | 实现 `CommandExecutor`。每路输出在宿主侧最多保留 `max_buffer_bytes`，超出丢弃并计数 |
-| `RemoteProcess` | `DaemonCommandExecutor.start` 返回的进程句柄，实现 `CommandProcess` |
-| `StreamingRemoteProcess` | `CommandSpec.stdin=True` 时 `DaemonCommandExecutor.start` 返回的进程句柄，实现 `StreamingCommandProcess`（内核 `McpStdioClient` 经执行器起 MCP server 要用）：`stdin` 写入经 `process/write`，`drain` 等守护进程回复；`close` 立即返回，后台发完缓冲再发 `process/closeStdin`；`communicate` 先关标准输入。进程结束或连接断开时 `stdout` / `stderr` 读到 EOF，`drain` 抛 `BrokenPipeError`。`max_buffer_bytes` 在这里是每路未读字节的上限，超过就杀掉进程，读取方拿到 `SandboxError` |
+| `DaemonCommandExecutor(client, default_cwd=None, max_buffer_bytes=16 MiB)` | 实现 `CommandExecutor`。`CommandSpec.stdin=False` 时返回 `RemoteProcess`，每路输出在宿主侧最多保留 `max_buffer_bytes`，超出丢弃并计数；`stdin=True` 时返回 `StreamingRemoteProcess`，`max_buffer_bytes` 是每路未读字节的上限 |
+| `RemoteProcess` | 一次性收输出的进程句柄，实现 `CommandProcess`。进程结束后 `communicate()` 返回两路输出，`dropped_bytes` 是因超限丢弃的字节数 |
+| `StreamingRemoteProcess` | 能持续对话的进程句柄，实现 `StreamingCommandProcess`，见下一节 |
+
+### `StreamingRemoteProcess`
+
+`CommandSpec.stdin=True` 时 `DaemonCommandExecutor.start` 返回它，内核 `McpStdioClient` 经执行器起 MCP server 用的就是这条路径。三个流的行为对齐 asyncio 的 `StreamWriter` / `StreamReader`：
+
+| 接口 | 说明 |
+| --- | --- |
+| `stdin.write(data)` | 放进待发缓冲。已 `close`、进程已结束或连接已断开时抛 `BrokenPipeError`，不静默丢弃 |
+| `stdin.drain()` | 把缓冲经 `process/write` 发出（超过 16 MiB 分块），等守护进程回复。**不限时**：进程不读标准输入时一直等，与本机管道一样；时限由调用方取消。进程已结束、标准输入已被关闭或连接已断开时抛 `BrokenPipeError` |
+| `drain()` 被取消 | 在途的那一块照常送达，还没发的留在缓冲里，下一次 `drain()` 接着发：写进去的字节按顺序恰好送达一次，字节流不会被写坏 |
+| `stdin.close()` | 立即返回；后台等在途的写、发完缓冲，再发 `process/closeStdin`。后台的失败只记日志 |
+| `stdin.wait_closed()` | 等后台关闭结束；不抛异常 |
+| `stdin.is_closing()` | 已 `close`，或写入端已不通 |
+| `stdout` / `stderr` 的 `readline()`、`read(n=-1)` | 边到边读。`read(n)` 有数据就返回、至多 `n` 字节；进程结束或连接断开时读到 EOF（空字节串） |
+| `communicate()` | 先关标准输入，再读完两路剩余输出并等退出 |
+| `kill()`、`wait()`、`returncode` | 与 `RemoteProcess` 相同 |
+
+某一路未读字节超过 `max_buffer_bytes`，或收到无法解码的输出块，就强杀进程，这一路此后的读取（含 `communicate()`）抛 `SandboxError`，不交出被截断的数据；另一路不受影响。流式进程从不丢弃输出，`dropped_bytes` 恒为 0。
 
 ### `DaemonWorkspace(client)`
 

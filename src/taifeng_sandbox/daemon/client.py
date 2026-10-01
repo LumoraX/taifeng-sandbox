@@ -120,13 +120,26 @@ class DaemonClient:
         params: dict[str, Any] | None = None,
         *,
         timeout_seconds: float | None = None,
+        no_timeout: bool = False,
     ) -> dict[str, Any]:
         """发请求并等待响应。
+
+        Args:
+            method: 方法名。
+            params: 参数对象；None 视为空对象。
+            timeout_seconds: 这次等待响应的上限；None 用连接的默认值。
+            no_timeout: 为真时不限时等待响应。只给以背压为语义、可能合法地长时间不回复的请求用
+                （``process/write``：进程不读标准输入时守护进程一直不回，与本机
+                ``StreamWriter.drain`` 一样该无限等）。连接断开照样让它以 ``SandboxProtocolError``
+                结束；时限由调用方经取消施加。不能与 ``timeout_seconds`` 同时给。
 
         Raises:
             SandboxRemoteError: 守护进程返回了错误。
             SandboxProtocolError: 连接已断、超时或响应畸形。
+            ValueError: 同时给了 ``timeout_seconds`` 与 ``no_timeout``。
         """
+        if no_timeout and timeout_seconds is not None:
+            raise ValueError("timeout_seconds 与 no_timeout 不能同时给")
         if self._failure is not None:
             raise self._failure
         if self._closed:
@@ -143,6 +156,8 @@ class DaemonClient:
         try:
             async with self._send_lock:
                 await self._transport.send(line)
+            if no_timeout:
+                return await future
             limit = self._timeout if timeout_seconds is None else timeout_seconds
             return await asyncio.wait_for(future, timeout=limit)
         except TimeoutError as exc:

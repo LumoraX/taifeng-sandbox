@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import shlex
 import sys
@@ -22,11 +23,13 @@ from taifeng_sandbox.daemon import (
     StdioTransport,
     StreamingRemoteProcess,
     protocol,
+    streaming,
 )
 from taifeng_sandbox.daemon.streaming import _StreamInput
 from tests.daemon.conftest import daemon_argv
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 ENV = {"PATH": "/usr/bin:/bin"}
@@ -67,6 +70,9 @@ ERR_ECHO = (
     "    sys.stderr.flush()\n"
 )
 
+# 读到 EOF 后把收到的字节原样写回 stdout
+CAT = "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"
+
 
 def _python(code: str) -> taifeng.CommandSpec:
     """以 ``stdin=True`` 跑一段 Python 的命令（与内核 ``McpStdioClient`` 一样走 shell=False）。"""
@@ -96,10 +102,35 @@ async def _readline(proc: StreamingRemoteProcess) -> bytes:
     return await asyncio.wait_for(proc.stdout.readline(), 10)
 
 
+async def _until(condition: Callable[[], bool]) -> None:
+    """让出事件循环直到条件成立，最多等 5 秒。"""
+    async with asyncio.timeout(5):
+        while not condition():  # noqa: ASYNC110 —— 轮询白盒状态，没有可等的事件
+            await asyncio.sleep(0)
+
+
+class _Recording:
+    """包一层执行器，记下启动过的进程，便于事后核对退出码。"""
+
+    def __init__(self, inner: DaemonCommandExecutor) -> None:
+        """包装 ``inner``。"""
+        self._inner = inner
+        self.started: list[taifeng.CommandProcess] = []
+
+    async def start(self, spec: taifeng.CommandSpec) -> taifeng.CommandProcess:
+        """转交 ``inner`` 启动并记下。"""
+        proc = await self._inner.start(spec)
+        self.started.append(proc)
+        return proc
+
+
 async def test_mcp_stdio_client_through_the_daemon(client: DaemonClient, tmp_path: Path) -> None:
-    """内核的 McpStdioClient 经守护进程执行器起 MCP server，握手、列工具、调用都通。"""
+    """内核的 McpStdioClient 经守护进程执行器起 MCP server：握手、列工具、调用都通，关闭后正常退出。
+
+    关闭时 server 读到 EOF 自己退出（退出码 0），而不是等满 3 秒被杀。
+    """
     (tmp_path / "server.py").write_text(MCP_SERVER)
-    executor = DaemonCommandExecutor(client, default_cwd=str(tmp_path))
+    executor = _Recording(DaemonCommandExecutor(client, default_cwd=str(tmp_path)))
     mcp = await taifeng.McpStdioClient.spawn(
         [sys.executable, str(tmp_path / "server.py")], env={}, executor=executor
     )
@@ -109,20 +140,58 @@ async def test_mcp_stdio_client_through_the_daemon(client: DaemonClient, tmp_pat
         assert result["content"][0]["text"] == "pong"
     finally:
         await mcp.close()
+    assert [proc.returncode for proc in executor.started] == [0]
 
 
 async def test_unread_output_over_the_limit_kills_and_fails(client: DaemonClient) -> None:
     """读取方不读、输出超过上限：杀掉进程，读取方拿到错误而不是被截断的数据。"""
     executor = DaemonCommandExecutor(client, max_buffer_bytes=1024)
-    code = "import sys; sys.stdout.write('x' * 100000); sys.stdin.read()"
-    proc = await executor.start(taifeng.CommandSpec(
-        command=f'{sys.executable} -c "{code}"', shell=True, cwd=None, env={}, stdin=True,
-    ))
-    assert isinstance(proc, taifeng.StreamingCommandProcess)
+    proc = await _start(executor, "import sys; sys.stdout.write('x' * 100000); sys.stdin.read()")
     await asyncio.wait_for(proc.wait(), 10)
     assert proc.stdout is not None
     with pytest.raises(SandboxError, match="缓冲上限"):
         await asyncio.wait_for(proc.stdout.read(), 10)
+    assert proc.dropped_bytes == 0
+
+
+async def test_one_stream_over_the_limit_leaves_the_other_intact(client: DaemonClient) -> None:
+    """stderr 超上限：stderr 读取抛错、进程被杀；stdout 已到的数据照常读完。"""
+    executor = DaemonCommandExecutor(client, max_buffer_bytes=1024)
+    proc = await _start(
+        executor,
+        "import sys; print('ok', flush=True); sys.stdin.readline(); "
+        "sys.stderr.write('e' * 100000); sys.stderr.flush(); sys.stdin.read()",
+    )
+    await _send(proc, b"go\n")
+    assert await asyncio.wait_for(proc.wait(), 10) != 0
+    assert proc.stdout is not None and proc.stderr is not None
+    with pytest.raises(SandboxError, match="stderr 未读输出超过宿主缓冲上限"):
+        await asyncio.wait_for(proc.stderr.read(), 10)
+    assert await asyncio.wait_for(proc.stdout.read(), 10) == b"ok\n"
+
+
+async def test_communicate_over_the_limit_raises(client: DaemonClient) -> None:
+    """communicate() 遇到某一路超上限：抛 SandboxError，不返回被截断的输出。"""
+    executor = DaemonCommandExecutor(client, max_buffer_bytes=1024)
+    proc = await _start(executor, "import sys; sys.stdout.write('x' * 100000)")
+    with pytest.raises(SandboxError, match="缓冲上限"):
+        await asyncio.wait_for(proc.communicate(), 10)
+    await asyncio.wait_for(proc.wait(), 10)
+
+
+async def test_undecodable_output_chunk_fails_the_stream(client: DaemonClient) -> None:
+    """流式进程收到不是合法 base64 的输出块：这一路失败并强杀进程，不悄悄少一块。"""
+    proc = await _start(DaemonCommandExecutor(client), "import sys; sys.stdin.read()")
+    params = {"processId": proc.process_id, "stream": "stdout", "data": "@@@"}
+    # 模拟守护进程发来畸形通知：经读循环的分发入口喂进去
+    client._dispatch(  # noqa: SLF001
+        json.dumps({"jsonrpc": "2.0", "method": "process/output", "params": params}).encode()
+    )
+    assert await asyncio.wait_for(proc.wait(), 10) != 0
+    assert proc.stdout is not None and proc.stderr is not None
+    with pytest.raises(SandboxError, match="无法解码"):
+        await asyncio.wait_for(proc.stdout.read(), 10)
+    assert await asyncio.wait_for(proc.stderr.read(), 10) == b""
 
 
 async def test_stdin_round_trip_then_close(client: DaemonClient) -> None:
@@ -167,6 +236,83 @@ async def test_write_larger_than_one_request_is_split(client: DaemonClient) -> N
     assert stdout == f"{size}\n".encode()
 
 
+async def test_write_waits_beyond_the_request_timeout(root: Path) -> None:
+    """``process/write`` 不受请求超时约束：进程迟迟不读、写入停在背压上超过请求时限，照样送达。"""
+    transport = await StdioTransport.spawn(daemon_argv(root))
+    daemon = await DaemonClient.connect(transport, request_timeout_seconds=1.0)
+    try:
+        proc = await _start(
+            DaemonCommandExecutor(daemon),
+            "import sys, time; time.sleep(2); print(len(sys.stdin.buffer.read()))",
+        )
+        assert proc.stdin is not None
+        # 远大于「管道容量 + 守护进程写缓冲水位线」：进程开始读之前这次写必然停在背压上
+        size = 4 * 1024 * 1024
+        proc.stdin.write(b"x" * size)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await asyncio.wait_for(proc.stdin.drain(), 20)
+        # 确实等过了请求时限（否则这个用例证明不了什么）
+        assert loop.time() - started > 1.0
+        proc.stdin.close()
+        stdout, _ = await asyncio.wait_for(proc.communicate(), 20)
+        assert stdout == f"{size}\n".encode()
+    finally:
+        await daemon.close()
+
+
+async def test_request_rejects_both_timeout_options(client: DaemonClient) -> None:
+    """同时给 ``timeout_seconds`` 与 ``no_timeout`` 是调用方的错误。"""
+    with pytest.raises(ValueError, match="no_timeout"):
+        await client.request(
+            protocol.METHOD_PROCESS_KILL, {"processId": "x"}, timeout_seconds=1, no_timeout=True
+        )
+
+
+async def test_cancelled_drain_still_delivers_the_inflight_chunk(
+    client: DaemonClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """drain 在途时被取消：在途那一块照常送达，剩下的下一次 drain 接着发，字节完整有序。
+
+    把分块上限调小，让一行分成多块；占住连接的发送锁（相当于同一连接上别的请求正在发），让在途
+    的那次 ``process/write`` 停在发出之前——这时取消，若不隔离取消，这一块就丢了。
+    """
+    monkeypatch.setattr(streaming, "_WRITE_CHUNK_BYTES", 4)
+    proc = await _start(DaemonCommandExecutor(client), CAT)
+    stdin = proc._stdin_stream  # noqa: SLF001
+    line = b"0123456789abcdef\n"
+    stdin.write(line)
+    async with client._send_lock:  # noqa: SLF001
+        drain = asyncio.ensure_future(stdin.drain())
+        await _until(lambda: stdin._inflight is not None)  # noqa: SLF001
+        drain.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await drain
+    await _send(proc, b"tail\n")
+    stdout, _ = await asyncio.wait_for(proc.communicate(), 10)
+    assert stdout == line + b"tail\n"
+
+
+async def test_close_waits_for_the_drain_in_flight(
+    client: DaemonClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """close 时恰有 drain 在途：后台关闭等它发完、再发完新追加的缓冲，最后才关。"""
+    monkeypatch.setattr(streaming, "_WRITE_CHUNK_BYTES", 4)
+    proc = await _start(DaemonCommandExecutor(client), CAT)
+    stdin = proc._stdin_stream  # noqa: SLF001
+    stdin.write(b"first line\n")
+    async with client._send_lock:  # noqa: SLF001
+        drain = asyncio.ensure_future(stdin.drain())
+        await _until(lambda: stdin._inflight is not None)  # noqa: SLF001
+        stdin.write(b"second\n")
+        stdin.close()
+    await asyncio.wait_for(drain, 10)
+    await asyncio.wait_for(stdin.wait_closed(), 10)
+    stdout, _ = await asyncio.wait_for(proc.communicate(), 10)
+    assert stdout == b"first line\nsecond\n"
+    assert proc.returncode == 0
+
+
 async def test_without_stdin_the_process_is_not_streaming(client: DaemonClient) -> None:
     """``stdin=False`` 仍返回原来的 RemoteProcess：一次性收输出，没有流。"""
     proc = await DaemonCommandExecutor(client).start(
@@ -180,7 +326,7 @@ async def test_without_stdin_the_process_is_not_streaming(client: DaemonClient) 
 
 @pytest.mark.parametrize("how", ["close_client", "kill_daemon"])
 async def test_connection_loss_ends_the_streams(root: Path, how: str) -> None:
-    """连接断开：挂在 readline 上的读取方拿到 EOF，wait() 返回，之后 drain() 抛 BrokenPipeError。"""
+    """连接断开：挂着的 readline 拿到 EOF，wait() 返回，之后 write / drain 抛 BrokenPipeError。"""
     transport = await StdioTransport.spawn(daemon_argv(root))
     daemon = await DaemonClient.connect(transport)
     try:
@@ -197,7 +343,8 @@ async def test_connection_loss_ends_the_streams(root: Path, how: str) -> None:
             transport._proc.kill()  # noqa: SLF001 —— 模拟守护进程意外死掉
         assert await asyncio.wait_for(pending, 10) == b""
         assert await asyncio.wait_for(proc.wait(), 10) != 0
-        proc.stdin.write(b"late\n")
+        with pytest.raises(BrokenPipeError):
+            proc.stdin.write(b"late\n")
         with pytest.raises(BrokenPipeError):
             await proc.stdin.drain()
         assert proc.stdin.is_closing()
@@ -206,11 +353,12 @@ async def test_connection_loss_ends_the_streams(root: Path, how: str) -> None:
 
 
 async def test_write_after_exit_is_a_broken_pipe(client: DaemonClient) -> None:
-    """进程退出后再写：drain() 抛 BrokenPipeError。"""
+    """进程退出后再写：write() 与 drain() 都抛 BrokenPipeError。"""
     proc = await _start(DaemonCommandExecutor(client), "pass")
     assert await asyncio.wait_for(proc.wait(), 10) == 0
     assert proc.stdin is not None
-    proc.stdin.write(b"late\n")
+    with pytest.raises(BrokenPipeError):
+        proc.stdin.write(b"late\n")
     with pytest.raises(BrokenPipeError):
         await proc.stdin.drain()
 
@@ -224,9 +372,15 @@ async def test_write_after_the_process_closed_its_stdin(client: DaemonClient) ->
     assert await _readline(proc) == b"ready\n"
     assert proc.stdin is not None
     proc.stdin.write(b"x")
-    with pytest.raises(BrokenPipeError):
+    with pytest.raises(BrokenPipeError) as caught:
         await asyncio.wait_for(proc.stdin.drain(), 10)
+    # 消息不层层套娃：本端一句话，后面跟守护进程的原因
+    message = str(caught.value)
+    assert message.startswith(f"进程 {proc.process_id} 的标准输入已不通：")
+    assert message.count("已不通") == 1
     assert proc.stdin.is_closing()
+    with pytest.raises(BrokenPipeError):
+        proc.stdin.write(b"y")
     proc.kill()
     assert await asyncio.wait_for(proc.wait(), 10) != 0
 

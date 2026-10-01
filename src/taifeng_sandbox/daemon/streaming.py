@@ -5,14 +5,14 @@ taifeng ``StreamingCommandProcess``：提供 ``stdin`` / ``stdout`` / ``stderr``
 v2 的 ``process/write``、``process/closeStdin`` 与 ``process/output`` 通知包成这三个流：
 
 - 写入端 ``_StreamInput``：``write`` 只进待发缓冲；``drain`` 把缓冲经 ``process/write`` 发出、等守护
-  进程回复（守护进程写缓冲回落到水位线以下才回复，这就是背压）；``close`` 是发起式的，在后台
-  先发完缓冲再发 ``process/closeStdin``。
+  进程回复（守护进程写缓冲回落到水位线以下才回复，这就是背压，不限时）；``close`` 是发起式的，
+  在后台先发完缓冲再发 ``process/closeStdin``。
 - 读取端 ``_StreamOutput``：输出通知喂进来，``readline`` / ``read`` 取走，进程结束时喂 EOF。未读
-  字节超过上限时杀掉进程、让读取方拿到错误——不交出被截断的数据。
+  字节超过上限、或收到无法解码的输出块时杀掉进程、让读取方拿到错误——不交出被截断的数据。
 
-接口与惯例参照 ``asyncio.StreamWriter`` / ``StreamReader``。差异：写入要经请求 / 响应往返；进程已
-结束或连接已断开时 ``drain`` 抛 ``BrokenPipeError``；已 ``close`` 后再 ``write`` 直接抛
-``BrokenPipeError``，不像 asyncio 那样静默丢弃。
+接口与惯例参照 ``asyncio.StreamWriter`` / ``StreamReader``。差异：写入要经请求 / 响应往返；写入端
+不通（已 ``close``、进程已结束或连接已断开）时 ``write`` 直接抛 ``BrokenPipeError``，不像 asyncio
+那样静默丢弃。
 """
 
 from __future__ import annotations
@@ -20,10 +20,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from taifeng_sandbox.daemon import protocol
-from taifeng_sandbox.daemon.executor import DEFAULT_MAX_BUFFER_BYTES, RemoteProcess
+from taifeng_sandbox.daemon.process import DEFAULT_MAX_BUFFER_BYTES, RemoteProcess
 from taifeng_sandbox.errors import SandboxError, SandboxProtocolError, SandboxRemoteError
 
 if TYPE_CHECKING:
@@ -118,11 +118,27 @@ class _StreamOutput:
         await self._changed.wait()
 
 
+def _retrieve_exception(task: asyncio.Task[dict[str, Any]]) -> None:
+    """取走在途写的异常，免得成为没人取的任务异常。
+
+    发起它的 ``drain`` 被取消、之后又没人再 ``drain`` 时才用得上；有人再等时，结果照常由
+    ``_StreamInput._await_inflight`` 处理。
+    """
+    if not task.cancelled():
+        task.exception()
+
+
 class _StreamInput:
     """标准输入的写入端，满足 taifeng ``CommandInput``。
 
-    写入顺序由宿主保证（线协议约定）：``drain`` 持锁发送，每块都等到回复再发下一块。每块先从
-    缓冲摘下再发，所以 ``drain`` 被取消时在途的那一块至多送达一次，不会重发。
+    语义对齐 asyncio 的传输缓冲：写入端不通之前，交给 ``write`` 的字节按顺序恰好送达一次。
+
+    - 顺序：``drain`` 持锁发送，每块等到回复再发下一块（线协议约定宿主串行写）。
+    - 取消：每次 ``process/write`` 是独立任务，``drain`` 只隔着 ``asyncio.shield`` 等它。``drain``
+      被取消时在途那一块照常送达，还没发的留在缓冲里；下一次 ``drain``（或后台关闭）先等在途
+      那块结束再接着发，字节流不会被写坏。
+    - 不限时：进程不读标准输入时守护进程一直不回复，这是背压，与本机 ``StreamWriter.drain`` 一样
+      无限等。连接断开会让它以 ``BrokenPipeError`` 结束；时限由调用方经取消施加。
     """
 
     def __init__(self, client: DaemonClient, process_id: str) -> None:
@@ -135,6 +151,7 @@ class _StreamInput:
         self._process_id = process_id
         self._pending = bytearray()
         self._lock = asyncio.Lock()
+        self._inflight: asyncio.Task[dict[str, Any]] | None = None
         self._closed = False
         self._broken = False
         self._close_task: asyncio.Task[None] | None = None
@@ -143,19 +160,22 @@ class _StreamInput:
         """追加到待发缓冲，``drain`` 时发出。
 
         Raises:
-            BrokenPipeError: 已经 ``close``。
+            BrokenPipeError: 已经 ``close``，或写入端已不通（进程已结束、连接已断开）。
         """
         if self._closed:
             raise BrokenPipeError(f"进程 {self._process_id} 的标准输入已关闭，不能再写")
+        self._raise_if_broken()
         self._pending.extend(data)
 
     async def drain(self) -> None:
-        """把待发缓冲发给守护进程，等到它回复（背压）。缓冲为空时只检查写入端是否还通。
+        """把待发缓冲发给守护进程，等到它回复（背压，不限时）。缓冲为空时只检查写入端是否还通。
+
+        被取消时：在途的那一块照常送达，还没发的留在缓冲里，下一次 ``drain`` 接着发。
 
         Raises:
             BrokenPipeError: 进程已结束、标准输入已被关闭，或到守护进程的连接已断开；
                 没发出的数据丢弃。
-            SandboxError: 其他失败（如连接还在但等回复超时）：在途那一块是否送达不确定。
+            SandboxError: 守护进程违反协议（意外的错误码、畸形响应）；写入端仍按可用处理。
         """
         async with self._lock:
             await self._flush()
@@ -184,17 +204,47 @@ class _StreamInput:
             await asyncio.shield(self._close_task)
 
     def mark_broken(self) -> None:
-        """进程已结束或连接已断开：此后 ``drain`` 抛 ``BrokenPipeError``。"""
+        """进程已结束或连接已断开：此后 ``write`` / ``drain`` 抛 ``BrokenPipeError``。"""
         self._broken = True
 
     async def _flush(self) -> None:
-        """（持锁调用）把待发缓冲分块发出，逐块等回复。"""
+        """（持锁调用）先等上一次留下的在途写，再把待发缓冲分块发出，逐块等回复。"""
+        await self._await_inflight()
         while self._pending:
             self._raise_if_broken()
             chunk = bytes(self._pending[:_WRITE_CHUNK_BYTES])
             del self._pending[: len(chunk)]
-            await self._send(chunk)
+            params = {"processId": self._process_id, "data": base64.b64encode(chunk).decode()}
+            self._inflight = asyncio.ensure_future(
+                self._client.request(protocol.METHOD_PROCESS_WRITE, params, no_timeout=True)
+            )
+            self._inflight.add_done_callback(_retrieve_exception)
+            await self._await_inflight()
         self._raise_if_broken()
+
+    async def _await_inflight(self) -> None:
+        """等在途的那次写结束，把它的失败翻成写入端的语义。
+
+        只隔着 shield 等：等的一方被取消时 ``CancelledError`` 照常上抛，在途写继续进行，
+        ``_inflight`` 留着给下一次先等。
+        """
+        task = self._inflight
+        if task is None:
+            return
+        try:
+            await asyncio.shield(task)
+        except SandboxRemoteError as exc:
+            self._inflight = None
+            if exc.code not in _BROKEN_PIPE_CODES:
+                raise
+            raise self._break(exc) from exc
+        except SandboxProtocolError as exc:
+            self._inflight = None
+            if not self._client.closed:
+                # 连接还在却失败：只可能是畸形响应（这个请求不设超时），守护进程违反协议
+                raise
+            raise self._break(exc) from exc
+        self._inflight = None
 
     def _raise_if_broken(self) -> None:
         """写入端已不通时丢弃待发数据并抛 ``BrokenPipeError``。"""
@@ -204,26 +254,11 @@ class _StreamInput:
                 f"进程 {self._process_id} 已结束或到守护进程的连接已断开，标准输入不再可写"
             )
 
-    async def _send(self, chunk: bytes) -> None:
-        """经 ``process/write`` 发一块并等回复；写入端不通的失败统一成 ``BrokenPipeError``。"""
-        params = {"processId": self._process_id, "data": base64.b64encode(chunk).decode("ascii")}
-        try:
-            await self._client.request(protocol.METHOD_PROCESS_WRITE, params)
-        except SandboxRemoteError as exc:
-            if exc.code not in _BROKEN_PIPE_CODES:
-                raise
-            raise self._break(exc) from exc
-        except SandboxProtocolError as exc:
-            if not self._client.closed:
-                # 连接还在（如等回复超时）：这一块是否送达不确定，如实上抛，写入端仍可用
-                raise
-            raise self._break(exc) from exc
-
     def _break(self, cause: SandboxError) -> BrokenPipeError:
         """标记写入端不通、丢弃待发数据，返回要抛出的 ``BrokenPipeError``。"""
         self.mark_broken()
         self._pending.clear()
-        return BrokenPipeError(f"写进程 {self._process_id} 的标准输入失败：{cause}")
+        return BrokenPipeError(f"进程 {self._process_id} 的标准输入已不通：{cause}")
 
     async def _close_remote(self) -> None:
         """后台关闭：等在途的 ``drain``、发完缓冲，再发 ``process/closeStdin``。
@@ -235,15 +270,17 @@ class _StreamInput:
                 await self._send_close()
 
     async def _flush_before_close(self) -> bool:
-        """关闭前发完缓冲；返回写入端是否还通（不通就不必再发关闭）。"""
+        """关闭前发完缓冲；返回是否还要发关闭（写入端已不通就不必了）。"""
         try:
             await self._flush()
         except BrokenPipeError as exc:
-            logger.debug("进程 %s 的标准输入已不通，关闭前缓冲未发完：%s", self._process_id, exc)
+            logger.debug("%s；关闭前缓冲未发完", exc)
             return False
         except SandboxError as exc:
+            # 只在守护进程违反协议时出现（意外的错误码、畸形响应），送达与否不明；
+            # 照样发关闭，免得进程一直等不到 EOF
             logger.warning("进程 %s 的标准输入关闭前发送缓冲失败：%s", self._process_id, exc)
-        return not self._broken
+        return True
 
     async def _send_close(self) -> None:
         """发 ``process/closeStdin``。守护进程总是立即回复。"""
@@ -270,11 +307,11 @@ class StreamingRemoteProcess(RemoteProcess):
     """守护进程里能持续对话的进程，满足 taifeng ``StreamingCommandProcess``。
 
     ``DaemonCommandExecutor.start`` 在 ``CommandSpec.stdin=True`` 时返回它。登记、强杀、退出码沿用
-    ``RemoteProcess``；输出不再一次性收齐，而是喂进 ``stdout`` / ``stderr`` 两个读取端。
+    ``RemoteProcess``；输出不进父类的一次性缓冲，而是喂进 ``stdout`` / ``stderr`` 两个读取端。
 
     ``max_buffer_bytes`` 是每路**未读**字节的上限：读取方跟不上、未读字节超过它时杀掉进程，这一路
-    此后读取抛 ``SandboxError``。进程结束或连接断开时两路读到 EOF，写入端的 ``drain`` 抛
-    ``BrokenPipeError``。
+    此后读取抛 ``SandboxError``；收到无法解码的输出块同样处理。另一路不受影响。进程结束或连接
+    断开时两路读到 EOF，写入端的 ``write`` / ``drain`` 抛 ``BrokenPipeError``。
     """
 
     def __init__(
@@ -305,18 +342,32 @@ class StreamingRemoteProcess(RemoteProcess):
         """标准错误的读取端。"""
         return self._stderr_stream
 
+    @property
+    def dropped_bytes(self) -> int:
+        """恒为 0：流式进程从不丢弃输出，超限或无法解码时整路失败（见类说明）。"""
+        return 0
+
+    def _output(self, stream: str) -> _StreamOutput:
+        """按名字取读取端。"""
+        return self._stderr_stream if stream == "stderr" else self._stdout_stream
+
     def _deliver(self, stream: str, chunk: bytes) -> None:
         """把一块输出喂给对应的读取端；未读字节超过上限就让这一路失败并杀掉进程。"""
-        target = self._stderr_stream if stream == "stderr" else self._stdout_stream
+        target = self._output(stream)
         target.feed(chunk)
         if target.unread > self._max_buffer_bytes:
-            target.fail(
-                SandboxError(
-                    f"进程 {self._process_id} 的 {stream} 未读输出超过宿主缓冲上限"
-                    f"（{self._max_buffer_bytes} 字节），已强杀进程"
-                )
-            )
-            self.kill()
+            self._fail_stream(stream, f"未读输出超过宿主缓冲上限（{self._max_buffer_bytes} 字节）")
+
+    def _on_undecodable(self, stream: str) -> None:
+        """收到无法解码的输出块：这一路已不完整，不能悄悄跳过，失败并杀掉进程。"""
+        self._fail_stream(stream, "收到无法解码的输出块（不是合法 base64）")
+
+    def _fail_stream(self, stream: str, reason: str) -> None:
+        """让一路失败（此后读取抛 ``SandboxError``）并强杀进程。"""
+        self._output(stream).fail(
+            SandboxError(f"进程 {self._process_id} 的 {stream} {reason}，已强杀进程")
+        )
+        self.kill()
 
     def _on_finished(self) -> None:
         """进程结束或连接断开：写入端不再通，两路读到 EOF。"""
@@ -327,8 +378,10 @@ class StreamingRemoteProcess(RemoteProcess):
     async def communicate(self) -> tuple[bytes, bytes]:
         """先关标准输入（与 asyncio ``Process.communicate`` 一致），再读完两路剩余输出、等待退出。
 
+        两路剩余输出各自都得放得进 ``max_buffer_bytes``。
+
         Raises:
-            SandboxError: 某一路未读字节超过上限、进程已被强杀。
+            SandboxError: 某一路未读字节超过上限或收到无法解码的输出块，进程已被强杀。
         """
         if not self._stdin_stream.is_closing():
             self._stdin_stream.close()

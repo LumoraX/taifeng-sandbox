@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from taifeng_sandbox.daemon.client import DaemonClient, daemon_source
-from taifeng_sandbox.daemon.executor import DaemonCommandExecutor, RemoteProcess
+from taifeng_sandbox.daemon.executor import DaemonCommandExecutor
+from taifeng_sandbox.daemon.process import RemoteProcess
 from taifeng_sandbox.daemon.protocol import PROTOCOL_VERSION
 from taifeng_sandbox.daemon.streaming import StreamingRemoteProcess
 from taifeng_sandbox.daemon.transport import StdioTransport, Transport

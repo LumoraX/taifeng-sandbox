@@ -71,7 +71,7 @@ taifeng 工具层（审批 / 黑名单 / env 白名单 / 超时 / 截断 / 取�
 
 ## 已知限制
 
-- 输出在进程结束后一次性取回，不是流式。
+- 经守护进程执行时，`CommandSpec.stdin=False` 的命令在进程结束后一次性取回输出；`stdin=True` 时是流式的（标准输入持续写、输出边到边读，见 [`StreamingRemoteProcess`](reference.md#streamingremoteprocess)），每路未读输出有上限，超限强杀进程并报错。
 - bubblewrap 后端只用命名空间与挂载，没有叠加 seccomp、Landlock。
 - seatbelt 的受限读模式允许对任意路径取元数据（不含内容与目录列表），否则进程无法沿父目录打开深层文件。
 - 出网只有开、关两档，没有域名白名单与出网代理。
