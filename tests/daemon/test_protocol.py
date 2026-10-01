@@ -33,6 +33,8 @@ def test_server_handles_every_declared_method() -> None:
     assert source is not None
     with open(source, encoding="utf-8") as handle:
         text = handle.read()
+    declared = {getattr(protocol, name) for name in protocol.__all__ if name.startswith("METHOD_")}
+    assert {"process/write", "process/closeStdin"} <= declared
     for name in protocol.__all__:
         if name.startswith(("METHOD_", "NOTIFY_")):
             assert f'"{getattr(protocol, name)}"' in text, name
@@ -103,7 +105,12 @@ async def test_malformed_line_is_skipped(root: Path) -> None:
         await transport.send(b"this is not json\n")
         reply = await _raw_exchange(
             transport,
-            {"jsonrpc": "2.0", "id": 7, "method": "initialize", "params": {"protocolVersion": 1}},
+            {
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "initialize",
+                "params": {"protocolVersion": protocol.PROTOCOL_VERSION},
+            },
         )
         assert reply["id"] == 7
         assert "result" in reply

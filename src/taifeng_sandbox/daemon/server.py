@@ -27,7 +27,7 @@ import stat
 import sys
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 SERVER_NAME = "taifeng-sandbox-daemon"
 
 ERROR_PARSE = -32700
@@ -79,6 +79,16 @@ def _optional_str(params: Params, key: str) -> Optional[str]:
         return None
     if not isinstance(value, str):
         raise RpcError(ERROR_INVALID_PARAMS, "参数 %s 必须是字符串" % key)
+    return value
+
+
+def _optional_bool(params: Params, key: str) -> bool:
+    """取可选布尔参数，未给（或为 null）时为假；给了却不是布尔值是参数错误，不按真假值宽松解释。"""
+    value = params.get(key)
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise RpcError(ERROR_INVALID_PARAMS, "参数 %s 必须是布尔值" % key)
     return value
 
 
@@ -284,7 +294,7 @@ def _require_str_or_empty(params: Params, key: str) -> str:
 
 
 class ProcessService:
-    """进程方法：启动、转发输出、报告退出、强杀。"""
+    """进程方法：启动、写标准输入、转发输出、报告退出、强杀。"""
 
     def __init__(
         self,
@@ -302,17 +312,22 @@ class ProcessService:
         self._watchers = set()  # type: set[asyncio.Future[None]]
 
     async def start(self, params: Params) -> Dict[str, Any]:
-        """启动进程。以新会话启动，强杀时连同其子进程一起终止。"""
+        """启动进程。以新会话启动，强杀时连同其子进程一起终止。
+
+        ``stdin`` 为真时标准输入接管道，之后经 ``process/write`` 写入、``process/closeStdin``
+        关闭；否则接 ``/dev/null``，进程一读就是 EOF。
+        """
         process_id = _require_str(params, "processId")
         argv = _require_str_list(params, "argv")
         env = _require_str_map(params, "env")
         cwd = self._working_directory(_optional_str(params, "cwd"))
+        wants_stdin = _optional_bool(params, "stdin")
         if process_id in self._processes:
             raise RpcError(ERROR_PROCESS_EXISTS, "processId 已存在：%s" % process_id)
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
-                stdin=asyncio.subprocess.DEVNULL,
+                stdin=asyncio.subprocess.PIPE if wants_stdin else asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
@@ -362,18 +377,76 @@ class ProcessService:
             )
 
     async def _watch(self, process_id: str, proc: asyncio.subprocess.Process) -> None:
-        """两路输出都读完、进程也退出之后，才发退出通知（保证输出不丢在退出之后）。"""
+        """两路输出都读完、进程也退出之后，才发退出通知（保证输出不丢在退出之后）。
+
+        进程在发退出通知之前移出进程表：宿主收到退出通知时这个 ``processId`` 已经不在表里，
+        之后的写入、强杀一律按「没有这个进程」处理，不会再对已回收的进程组发信号。
+        """
         try:
             await asyncio.gather(
                 self._forward(process_id, "stdout", proc.stdout),
                 self._forward(process_id, "stderr", proc.stderr),
             )
             exit_code = await proc.wait()
-            await self._notify(
-                "process/exited", {"processId": process_id, "exitCode": exit_code}
-            )
         finally:
-            self._processes.pop(process_id, None)
+            if self._processes.get(process_id) is proc:
+                del self._processes[process_id]
+        await self._notify("process/exited", {"processId": process_id, "exitCode": exit_code})
+
+    def _stdin_of(self, process_id: str) -> Optional[asyncio.StreamWriter]:
+        """取进程的标准输入（没要时为 ``None``）；进程不在表里是 ``ERROR_PROCESS_UNKNOWN``。"""
+        proc = self._processes.get(process_id)
+        if proc is None:
+            raise RpcError(ERROR_PROCESS_UNKNOWN, "没有这个进程：%s" % process_id)
+        return proc.stdin
+
+    async def write(self, params: Params) -> Dict[str, Any]:
+        """向进程的标准输入写一段数据，等管道接收（``drain``）之后才回复。
+
+        写入顺序由宿主保证：每次写都等到响应才发下一次。守护进程为每条请求各起一个任务，
+        所以并发发出的两次写不保证顺序。
+
+        启动时没要标准输入的进程不能写（``ERROR_INVALID_PARAMS``），不静默丢弃；标准输入已关闭、
+        或进程那头已断开时是 ``ERROR_IO``。
+        """
+        process_id = _require_str(params, "processId")
+        try:
+            data = base64.b64decode(_require_str_or_empty(params, "data"), validate=True)
+        except ValueError as exc:
+            raise RpcError(ERROR_INVALID_PARAMS, "data 不是合法的 base64") from exc
+        if len(data) > MAX_FILE_BYTES:
+            raise RpcError(ERROR_TOO_LARGE, "单次写入超过上限")
+        stdin = self._stdin_of(process_id)
+        if stdin is None:
+            raise RpcError(ERROR_INVALID_PARAMS, "进程启动时没有要标准输入：%s" % process_id)
+        # 关闭中的管道会把写入静默丢掉，必须先拦下
+        if stdin.is_closing():
+            raise RpcError(ERROR_IO, "进程的标准输入已关闭：%s" % process_id)
+        try:
+            stdin.write(data)
+            await stdin.drain()
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            raise RpcError(ERROR_IO, "进程的标准输入已断开：%s" % process_id) from exc
+        return {"bytesWritten": len(data)}
+
+    async def close_stdin(self, params: Params) -> Dict[str, Any]:
+        """关闭进程的标准输入，进程随后读到 EOF。
+
+        没要标准输入的进程本来就读得到 EOF，重复关闭也一样，都不算错。回复之前等管道真正关闭
+        （缓冲里剩下的数据写完）；这一步发现进程那头已断开，说明有数据没送到，报 ``ERROR_IO``。
+        """
+        process_id = _require_str(params, "processId")
+        stdin = self._stdin_of(process_id)
+        if stdin is None:
+            return {}
+        stdin.close()
+        try:
+            await stdin.wait_closed()
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            raise RpcError(
+                ERROR_IO, "进程的标准输入已断开，有数据没送到：%s" % process_id
+            ) from exc
+        return {}
 
     async def kill(self, params: Params) -> Dict[str, Any]:
         """强杀进程组。进程已结束不算错（宿主的强杀与自然退出可能竞争）。"""
@@ -393,14 +466,22 @@ class ProcessService:
 
 
 def _kill_group(proc: asyncio.subprocess.Process) -> None:
-    """对进程组发 SIGKILL；进程组已不存在时无事可做。"""
-    if proc.returncode is not None:
-        return
+    """对整个进程组发 SIGKILL。
+
+    不看 ``returncode``：shell 先退出、它派生的子进程仍占着管道时，主进程已经有退出码，但组里还有
+    成员要杀（与内核 ADR 0108 一致）。调用方只对还在进程表里的进程调用——监视任务收完两路输出、
+    进程也退出之后才把它移出进程表，表里还在就说明组里可能还有成员，照样按组杀。
+
+    进程组已不存在（``ProcessLookupError``）说明已经干净；无权按组杀（``PermissionError``）时
+    退回只杀主进程，主进程已退出就无事可做。
+    """
     try:
         os.killpg(proc.pid, signal.SIGKILL)
     except ProcessLookupError:
         return
     except PermissionError:
+        if proc.returncode is not None:
+            return
         try:
             proc.kill()
         except ProcessLookupError:
@@ -422,6 +503,8 @@ class Daemon:
         files = FileService(self._guard)
         self._handlers = {
             "process/start": self._processes.start,
+            "process/write": self._processes.write,
+            "process/closeStdin": self._processes.close_stdin,
             "process/kill": self._processes.kill,
             "fs/readFile": files.read_file,
             "fs/writeFile": files.write_file,

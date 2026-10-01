@@ -1,8 +1,12 @@
-"""宿主与沙盒内守护进程之间的线协议（版本 1）。
+"""宿主与沙盒内守护进程之间的线协议（版本 2）。
 
 设计参照 codex ``exec-server-protocol``（Apache-2.0）：JSON-RPC 2.0 消息形状、先握手再调用、
 进程输出与退出走通知。差异：协议由本仓自有并做版本管理（ADR 0002 否决了直接依赖 codex
 内部协议）；传输是按行分隔的 JSON，一行一条消息；只保留进程与文件两组方法。
+
+v2 相对 v1：进程可以接标准输入——``process/start`` 新增可选布尔参数 ``stdin``，为真时标准输入接管道
+（v1 固定接 ``/dev/null``）；新增 ``process/write``（向标准输入写一段数据）与
+``process/closeStdin``（关闭标准输入）两个方法。
 
 消息形状::
 
@@ -21,12 +25,14 @@ from __future__ import annotations
 
 from typing import Final
 
-PROTOCOL_VERSION: Final = 1
+PROTOCOL_VERSION: Final = 2
 
 # --- 方法名 ---
 METHOD_INITIALIZE: Final = "initialize"
 METHOD_SHUTDOWN: Final = "shutdown"
 METHOD_PROCESS_START: Final = "process/start"
+METHOD_PROCESS_WRITE: Final = "process/write"
+METHOD_PROCESS_CLOSE_STDIN: Final = "process/closeStdin"
 METHOD_PROCESS_KILL: Final = "process/kill"
 METHOD_FS_READ_FILE: Final = "fs/readFile"
 METHOD_FS_WRITE_FILE: Final = "fs/writeFile"
@@ -88,8 +94,10 @@ __all__ = [
     "METHOD_FS_REMOVE",
     "METHOD_FS_WRITE_FILE",
     "METHOD_INITIALIZE",
+    "METHOD_PROCESS_CLOSE_STDIN",
     "METHOD_PROCESS_KILL",
     "METHOD_PROCESS_START",
+    "METHOD_PROCESS_WRITE",
     "METHOD_SHUTDOWN",
     "NOTIFY_PROCESS_EXITED",
     "NOTIFY_PROCESS_OUTPUT",

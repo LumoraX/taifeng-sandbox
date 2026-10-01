@@ -1,4 +1,4 @@
-# 线协议第 1 版（活文档）
+# 线协议第 2 版（活文档）
 
 > 宿主侧客户端与沙盒内守护进程之间的协议。设计取舍见 [ADR 0003](../decisions/0003-protocol-v1-and-trust-boundaries.md)；
 > 常量的权威定义在 `src/taifeng_sandbox/daemon/protocol.py`，守护进程的实现在同目录的 `server.py`。
@@ -14,8 +14,8 @@
 - 守护进程的标准输出只用来发协议消息；诊断信息走标准错误。
 
 ```
-→ {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": 1, "clientName": "taifeng-sandbox"}}
-← {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1, "serverName": "…", "platform": "linux", "pythonVersion": "3.12.7", "root": "/workspace", "pid": 17}}
+→ {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": 2, "clientName": "taifeng-sandbox"}}
+← {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 2, "serverName": "…", "platform": "linux", "pythonVersion": "3.12.7", "root": "/workspace", "pid": 17}}
 ```
 
 ## 生命周期
@@ -31,7 +31,7 @@
 
 | 参数 | 类型 | 说明 |
 | --- | --- | --- |
-| `protocolVersion` | 整数 | 必须等于 `1`，否则 `-32001` |
+| `protocolVersion` | 整数 | 必须等于 `2`，否则 `-32001` |
 | `clientName` | 字符串 | 可选，仅用于诊断 |
 
 返回 `protocolVersion`、`serverName`、`platform`、`pythonVersion`、`root`、`pid`。
@@ -48,15 +48,45 @@
 | `argv` | 字符串数组 | 直接执行，不经 shell。要跑 shell 命令就传 `["/bin/sh", "-c", "…"]` |
 | `env` | 字符串到字符串的映射 | 进程的**完整**环境。守护进程不把自己的环境传下去 |
 | `cwd` | 字符串 | 可选。省略用根目录。不受根目录约束（见 ADR 0003 决策 5） |
+| `stdin` | 布尔 | 可选，默认 `false`。为 `true` 时标准输入接管道，之后用 `process/write` 写、`process/closeStdin` 关；否则接 `/dev/null`。给了却不是布尔值是 `-32602` |
 
 返回 `{"pid": …}`。找不到可执行文件是 `-32010`，其他启动失败是 `-32011`。
 
-进程以新会话启动，标准输入接 `/dev/null`。启动之后，守护进程主动发通知：
+进程以新会话启动（自成一个进程组）。启动之后，守护进程主动发通知：
 
 | 通知 | 参数 | 说明 |
 | --- | --- | --- |
 | `process/output` | `processId`、`stream`（`stdout` 或 `stderr`）、`data`（base64） | 一块输出，最大 32 KiB |
 | `process/exited` | `processId`、`exitCode` | 进程已退出。**一定排在这个进程的全部输出通知之后**，收到它就可以认定输出完整 |
+
+「进程已经结束」指两路输出都读到 EOF、主进程也已退出——守护进程这时把它移出进程表，然后才发 `process/exited`。此后对这个 `processId` 的 `process/write`、`process/closeStdin` 是 `-32013`，`process/kill` 返回 `{"killed": false}`。
+
+### `process/write`
+
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `processId` | 字符串 | |
+| `data` | 字符串 | 要写进标准输入的内容，base64，可为空串。解码后单次最大 16 MiB，超过是 `-32023` |
+
+返回 `{"bytesWritten": …}`。守护进程等管道接收（drain）之后才回复。
+
+| 情形 | 错误码 |
+| --- | --- |
+| 没有这个进程（含已结束） | `-32013` |
+| 启动时没给 `stdin: true`；`data` 不是合法 base64 | `-32602` |
+| 标准输入已经关闭，或进程那头已断开 | `-32022` |
+
+**写入顺序由宿主保证**：每次写都等到响应再发下一次。守护进程为每条请求各起一个任务，并发发出的两次写不保证先后。
+
+### `process/closeStdin`
+
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `processId` | 字符串 | |
+
+关闭标准输入，进程随后读到 EOF。返回 `{}`。守护进程等管道真正关闭（缓冲里剩下的数据写完）之后才回复；这一步发现进程那头已断开、有数据没送到时是 `-32022`。
+
+没有这个进程是 `-32013`。启动时没要标准输入的进程、已经关过的标准输入再关，都返回 `{}`，不算错。
 
 ### `process/kill`
 
@@ -64,7 +94,7 @@
 | --- | --- | --- |
 | `processId` | 字符串 | |
 
-强杀整个进程组。返回 `{"killed": true}`；进程已经结束或不存在返回 `{"killed": false}`，不算错——强杀与自然退出本来就可能竞争。
+强杀整个进程组。主进程（例如 shell）已经退出、但它派生的子进程还占着输出管道时，进程仍在进程表里，同样按组杀到（与 taifeng ADR 0108 一致）。返回 `{"killed": true}`；进程已经结束或不存在返回 `{"killed": false}`，不算错——强杀与自然退出本来就可能竞争。
 
 ### 文件方法
 
@@ -105,4 +135,9 @@
 
 ## 版本
 
-协议版本是一个整数，当前为 `1`。不兼容的变更升版本号；守护进程只接受与自己相同的版本。守护进程的源码随本包分发、由宿主在连接时注入，所以客户端与守护进程总是同一个版本，不存在新旧混用。
+协议版本是一个整数，当前为 `2`。不兼容的变更升版本号；守护进程只接受与自己相同的版本。守护进程的源码随本包分发、由宿主在连接时注入，所以客户端与守护进程总是同一个版本，不存在新旧混用。
+
+| 版本 | 相对上一版的变化 |
+| --- | --- |
+| `2` | 进程可以接标准输入：`process/start` 新增 `stdin` 参数；新增 `process/write`、`process/closeStdin` |
+| `1` | 初版 |
