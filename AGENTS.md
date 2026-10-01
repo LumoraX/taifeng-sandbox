@@ -4,7 +4,7 @@
 
 ## 项目身份
 
-**taifeng-sandbox** 是 [taifeng](https://github.com/LumoraX/taifeng) 的执行隔离适配层：实现 taifeng 的执行类协议（`CommandExecutor`、`ScriptExecutor`，以及待落地的 `WorkspaceFS`），把进程放进本机隔离、容器或远端沙盒。
+**taifeng-sandbox** 是 [taifeng](https://github.com/LumoraX/taifeng) 的执行隔离适配层：实现 taifeng 的执行类协议（`CommandExecutor`、`ScriptExecutor`、`WorkspaceFS`），把进程放进本机隔离、容器或远端沙盒。
 
 它不是 agent 框架，不含业务概念，也不是某个平台的私有组件——任何 taifeng 宿主都可以单独引入。
 

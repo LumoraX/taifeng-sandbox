@@ -2,7 +2,7 @@
 
 > 本目录只描述**当前生效的设计**；为什么这么定见 [../decisions/](../decisions/README.md)。
 >
-> 相关：[接口参考](reference.md) · [线协议第 1 版](protocol.md)
+> 相关：[接口参考](reference.md) · [线协议第 2 版](protocol.md)
 
 ## 现状
 
@@ -11,14 +11,15 @@
 ## 分层
 
 ```
-taifeng 工具层（审批 / 黑名单 / env 白名单 / 超时 / 截断 / 取消）
-        │  CommandExecutor · ScriptExecutor（taifeng 协议）
+taifeng 工具层（审批 / 黑名单 / env 白名单 / 超时 / 截断 / 取消 / 文件类工具的路径规则与上限）
+        │  CommandExecutor · ScriptExecutor · WorkspaceFS（taifeng 协议）
         ▼
 本仓宿主侧实现
   ├─ SandboxedScriptExecutor ── 把脚本交给下面任意一个 CommandExecutor
   ├─ 本机隔离：SeatbeltCommandExecutor / BwrapCommandExecutor
   │            直接包装本机进程启动，不需要守护进程
-  └─ DaemonCommandExecutor ──线协议──▶ 沙盒内守护进程
+  └─ DaemonCommandExecutor ┐
+     DaemonWorkspace ──────┴──线协议──▶ 沙盒内守护进程
         ▲                                   ▲
         └── 环境提供者只负责拉起环境并建立连接 ┘
             DockerEnvironment（docker run + docker exec -i）
@@ -31,7 +32,7 @@ taifeng 工具层（审批 / 黑名单 / env 白名单 / 超时 / 截断 / 取�
 | `taifeng_sandbox.policy` | `SandboxPolicy`：可读范围、可写根、不可读路径、是否出网。与后端无关，默认拒绝写、拒绝出网 |
 | `taifeng_sandbox.local` | `seatbelt` / `bwrap`：策略到命令行的纯计算；`executor`：两个本机执行器与按平台选择的工厂；`process`：进程组句柄 |
 | `taifeng_sandbox.script` | `SandboxedScriptExecutor`：参数展开、超时、取消、截断，启动交给注入的 `CommandExecutor` |
-| `taifeng_sandbox.daemon` | `protocol`：线协议常量；`server`：守护进程（单文件、只用标准库）；`transport` / `client`：宿主侧连接；`executor`：`DaemonCommandExecutor`；`workspace`：`DaemonWorkspace` 文件视图 |
+| `taifeng_sandbox.daemon` | `protocol`：线协议常量；`server`：守护进程（单文件、只用标准库）；`transport` / `client`：宿主侧连接；`executor`：`DaemonCommandExecutor`；`workspace`：`DaemonWorkspace`，实现 `WorkspaceFS` 的文件视图 |
 | `taifeng_sandbox.docker` | `config`：`DockerSandboxConfig` 与 `docker run` 参数；`environment`：`DockerEnvironment` |
 | `taifeng_sandbox.errors` | 异常类型。启动类失败都是 `OSError` 子类 |
 
@@ -53,7 +54,7 @@ taifeng 工具层（审批 / 黑名单 / env 白名单 / 超时 / 截断 / 取�
 | 边界 | 由谁守 |
 | --- | --- |
 | 进程能碰什么（文件、出网） | 执行环境：seatbelt 配置、bubblewrap 挂载与命名空间、容器 |
-| 宿主经文件方法能碰什么 | 守护进程根目录约束（解析符号链接后判断） |
+| 宿主经文件方法能碰什么 | `DaemonWorkspace.resolve` 先按字面拦下 `..` 与根外绝对路径；守护进程根目录约束再按真实路径判断（解析符号链接之后），越界是 `-32024` |
 | 命令该不该执行 | taifeng 工具层 |
 
 环境变量在每一层都是「给什么用什么」：执行器把 `CommandSpec.env` 当作完整环境，不叠加宿主环境；守护进程同样不把自己的环境传给子进程。
@@ -76,7 +77,8 @@ taifeng 工具层（审批 / 黑名单 / env 白名单 / 超时 / 截断 / 取�
 - seatbelt 的受限读模式允许对任意路径取元数据（不含内容与目录列表），否则进程无法沿父目录打开深层文件。
 - 出网只有开、关两档，没有域名白名单与出网代理。
 - 容器后端要求镜像里有 Python 3.9+。
-- 文件类工具仍在宿主机上读写：taifeng 的 `WorkspaceFS` 协议尚未落地，`DaemonWorkspace` 目前只有本仓自己的接口。
+- 经 `DaemonWorkspace` 写入超过 16 MiB 的文件不是原子的：线协议单次最多 16 MiB，第一段原子替换，之后逐段追加；线协议没有 rename。
+- `DaemonWorkspace` 列目录不跟随符号链接，协议也不给链接目标：内核的 `glob` / `grep` 在非本机工作区上一律跳过符号链接，并在输出尾注里告知（taifeng ADR 0113）。
 
 ## 依赖的 taifeng 协议
 
@@ -84,6 +86,6 @@ taifeng 工具层（审批 / 黑名单 / env 白名单 / 超时 / 截断 / 取�
 | --- | --- | --- |
 | `CommandExecutor` / `CommandProcess` / `CommandSpec` | `taifeng.tool.command_executor` | 是（taifeng ≥ 2026.9.30.1） |
 | `ScriptExecutor` / `ScriptInvocation` / `ScriptResult` | `taifeng.skill.scripts` | 是 |
-| `WorkspaceFS` | 尚不存在 | — |
+| `WorkspaceFS` / `WorkspaceFileInfo` / `WorkspaceEntry` / `WorkspacePathError` | `taifeng.tool.workspace` | 是（taifeng ≥ 2026.10.1.10） |
 
 taifeng 自 2026.9.30.1 起带 `py.typed`，本仓对 taifeng 协议的使用受 mypy strict 检查。

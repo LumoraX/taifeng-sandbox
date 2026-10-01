@@ -6,7 +6,7 @@
 
 v2 相对 v1：进程可以接标准输入——``process/start`` 新增可选布尔参数 ``stdin``，为真时标准输入接管道
 （v1 固定接 ``/dev/null``）；新增 ``process/write``（向标准输入写一段数据）与
-``process/closeStdin``（关闭标准输入）两个方法。
+``process/closeStdin``（关闭标准输入）两个方法；路径越界从 ``-32020`` 中分出来，单独用 ``-32024``。
 
 消息形状::
 
@@ -59,10 +59,13 @@ ERROR_SPAWN_NOT_FOUND: Final = -32010
 ERROR_SPAWN_FAILED: Final = -32011
 ERROR_PROCESS_EXISTS: Final = -32012
 ERROR_PROCESS_UNKNOWN: Final = -32013
+# 操作系统拒绝访问，或删除根目录本身；越界不用它，见 ERROR_OUTSIDE_ROOT
 ERROR_ACCESS_DENIED: Final = -32020
 ERROR_NOT_FOUND: Final = -32021
 ERROR_IO: Final = -32022
 ERROR_TOO_LARGE: Final = -32023
+# 路径（解析符号链接之后）在根目录之外
+ERROR_OUTSIDE_ROOT: Final = -32024
 
 # 单条消息（一行）的字节上限；文件读写按此留出 base64 膨胀余量
 MAX_MESSAGE_BYTES: Final = 32 * 1024 * 1024
@@ -78,6 +81,7 @@ __all__ = [
     "ERROR_METHOD_NOT_FOUND",
     "ERROR_NOT_FOUND",
     "ERROR_NOT_INITIALIZED",
+    "ERROR_OUTSIDE_ROOT",
     "ERROR_PARSE",
     "ERROR_PROCESS_EXISTS",
     "ERROR_PROCESS_UNKNOWN",

@@ -77,7 +77,7 @@
 ```python
 async with await DockerEnvironment.create(config) as sandbox:
     sandbox.executor()     # DaemonCommandExecutor，实现 CommandExecutor
-    sandbox.workspace()    # DaemonWorkspace，文件访问
+    sandbox.workspace()    # DaemonWorkspace，实现 WorkspaceFS
     sandbox.name           # 容器名
 ```
 
@@ -143,20 +143,42 @@ async with await DockerEnvironment.create(config) as sandbox:
 
 ### `DaemonWorkspace(client)`
 
-经守护进程访问它根目录之内的文件。
+经守护进程访问它根目录之内的文件，实现 taifeng 的 `WorkspaceFS`（taifeng ADR 0113）。交给内核文件类工具的 `workspace=`，模型读写的就是沙盒里的文件：
 
-| 方法 | 说明 |
+```python
+import taifeng
+from taifeng_sandbox.daemon import DaemonWorkspace
+
+workspace = DaemonWorkspace(client)       # 或 DockerEnvironment.workspace()
+tools = [
+    taifeng.make_file_read_tool(workspace=workspace),
+    taifeng.make_file_write_tool(workspace=workspace),
+    taifeng.make_apply_patch_tool(workspace=workspace),
+    taifeng.make_glob_tool(workspace=workspace),
+    taifeng.make_grep_tool(workspace=workspace),
+]
+```
+
+| 成员 | 说明 |
 | --- | --- |
+| `root` | 守护进程根目录的真实路径（握手时上报）。握手信息里没有它时抛 `SandboxProtocolError` |
+| `resolve(path)` | 同步、不发请求：相对路径拼到 `root`，按字面折叠 `..`，落在 `root` 之外抛 `taifeng.WorkspacePathError`；返回字符串。**不跟随符号链接**，守护进程收到请求后还会按真实路径再校验 |
 | `read_bytes(path)` / `read_text(path, encoding="utf-8")` | 读文件。大文件自动分段 |
-| `write_bytes(path, data, create_parents=True)` / `write_text(…)` | 写文件。大文件自动分段 |
-| `list_directory(path)` | 返回 `DirectoryEntry` 列表：`name`、`is_directory`、`is_file`、`is_symlink` |
-| `metadata(path)` | 返回 `FileMetadata`：`exists`、`is_directory`、`is_file`、`size`、`modified_at` |
-| `create_directory(path, recursive=True)` | 建目录 |
-| `remove(path, recursive=False)` | 删除 |
+| `write_bytes(path, data, create_parents=True)` / `write_text(…)` | 覆盖写入。不超过 16 MiB 时是原子的（守护进程写临时文件再替换）；**更大的内容分段写入，不是原子的**：第一段原子替换，之后逐段追加，读者可能看到只写了前几段的文件 |
+| `list_directory(path)` | 返回 `taifeng.WorkspaceEntry` 列表：`name`、`is_directory`、`is_file`、`is_symlink`（不跟随符号链接判定），按名字排序 |
+| `metadata(path)` | 返回 `taifeng.WorkspaceFileInfo`：`exists`、`is_directory`、`is_file`、`size`、`modified_at`。不存在（含路径中间某一段是文件）时 `exists=False`，不抛异常 |
+| `create_directory(path, recursive=True)` | 建目录（`WorkspaceFS` 之外的附加方法） |
+| `remove(path, recursive=False)` | 删除；目录不给 `recursive` 时须为空，根目录本身不允许删 |
 
-文件不存在抛 `FileNotFoundError`，路径在根目录之外抛 `PermissionError`。
+每个方法都先调 `resolve`，自己校验边界，不依赖调用方先调过它。失败用标准 `OSError` 子类表达：
 
-这是本包自己的接口：taifeng 的 `WorkspaceFS` 协议尚未落地，落地后会对齐。
+| 情形 | 异常 |
+| --- | --- |
+| 不存在；`create_parents=False` 时父目录不存在 | `FileNotFoundError` |
+| 路径在根目录之外，含根内指向根外的符号链接 | `taifeng.WorkspacePathError`（`PermissionError` 的子类） |
+| 操作系统拒绝访问；删除根目录本身 | `PermissionError` |
+| 其他（非空目录、读目录当文件等） | `SandboxRemoteError`（`OSError` 子类，`code` 是线协议错误码） |
+| 连接断开、响应畸形 | `SandboxProtocolError` |
 
 ## 异常
 

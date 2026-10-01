@@ -19,12 +19,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import contextlib
 import json
 import os
 import shutil
 import signal
 import stat
 import sys
+import tempfile
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 PROTOCOL_VERSION = 2
@@ -45,6 +47,7 @@ ERROR_ACCESS_DENIED = -32020
 ERROR_NOT_FOUND = -32021
 ERROR_IO = -32022
 ERROR_TOO_LARGE = -32023
+ERROR_OUTSIDE_ROOT = -32024
 
 MAX_MESSAGE_BYTES = 32 * 1024 * 1024
 MAX_FILE_BYTES = 16 * 1024 * 1024
@@ -129,7 +132,7 @@ class PathGuard:
         candidate = requested if os.path.isabs(requested) else os.path.join(self.root, requested)
         real = os.path.realpath(candidate)
         if real != self.root and not real.startswith(self.root.rstrip(os.sep) + os.sep):
-            raise RpcError(ERROR_ACCESS_DENIED, "路径在沙盒根目录之外：%s" % requested)
+            raise RpcError(ERROR_OUTSIDE_ROOT, "路径在沙盒根目录之外：%s" % requested)
         return real
 
 
@@ -146,8 +149,10 @@ class FileService:
     """文件访问方法。磁盘 IO 放到线程池，不阻塞事件循环。"""
 
     def __init__(self, guard: PathGuard) -> None:
-        """绑定路径守卫。"""
+        """绑定路径守卫，并记下 umask（只能「设置并取回旧值」；此时还没有工作线程在建文件）。"""
         self._guard = guard
+        self._umask = os.umask(0o077)
+        os.umask(self._umask)
 
     async def read_file(self, params: Params) -> Dict[str, Any]:
         """读文件；支持 ``offset`` / ``length`` 分段读取大文件。"""
@@ -174,28 +179,55 @@ class FileService:
         }
 
     async def write_file(self, params: Params) -> Dict[str, Any]:
-        """写文件；``append`` 追加，``createParents`` 自动建父目录。"""
+        """写文件；``append`` 追加，``createParents`` 自动建父目录。
+
+        非追加写入是原子的：同目录写临时文件，再 ``os.replace`` 到目标，读者只会看到旧内容或新内容；
+        失败时删掉临时文件。``mkstemp`` 建出的 0600 不带到目标上：覆盖保持原权限（可执行位不丢），
+        新建按 umask，与直接 ``open`` 写入的结果一致。
+        """
         path = self._guard.resolve(_require_str(params, "path"))
+        if path == self._guard.root:
+            # 否则临时文件会建到根目录的父目录里，即根目录之外
+            raise RpcError(ERROR_IO, "根目录是目录，不能当文件写：%s" % path)
         try:
             data = base64.b64decode(_require_str_or_empty(params, "data"), validate=True)
         except ValueError as exc:
             raise RpcError(ERROR_INVALID_PARAMS, "data 不是合法的 base64") from exc
         if len(data) > MAX_FILE_BYTES:
             raise RpcError(ERROR_TOO_LARGE, "单次写入超过上限")
-        mode = "ab" if params.get("append") else "wb"
+        append = bool(params.get("append"))
         create_parents = bool(params.get("createParents"))
 
         def _write() -> None:
             if create_parents:
                 os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, mode) as handle:
-                handle.write(data)
+            if append:
+                with open(path, "ab") as handle:
+                    handle.write(data)
+                return
+            fd, temp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(data)
+                os.chmod(temp, self._replaced_mode(path))
+                os.replace(temp, path)
+            except BaseException:
+                with contextlib.suppress(OSError):  # 清理失败不掩盖原始错误
+                    os.unlink(temp)
+                raise
 
         try:
             await asyncio.get_event_loop().run_in_executor(None, _write)
         except OSError as exc:
             raise _map_os_error(exc, path) from exc
         return {"bytesWritten": len(data)}
+
+    def _replaced_mode(self, path: str) -> int:
+        """原子替换后目标的权限：已存在保持原权限，新建按 umask。"""
+        try:
+            return stat.S_IMODE(os.stat(path).st_mode)
+        except FileNotFoundError:
+            return 0o666 & ~self._umask
 
     async def read_directory(self, params: Params) -> Dict[str, Any]:
         """列目录（不递归），按名字排序。"""
@@ -222,13 +254,13 @@ class FileService:
         return {"entries": entries}
 
     async def get_metadata(self, params: Params) -> Dict[str, Any]:
-        """取元数据；不存在时返回 ``exists=False`` 而不是报错。"""
+        """取元数据；不存在（含路径中间某段是文件）时返回 ``exists=False`` 而不是报错。"""
         path = self._guard.resolve(_require_str(params, "path"))
 
         def _stat() -> Optional[os.stat_result]:
             try:
                 return os.stat(path)
-            except FileNotFoundError:
+            except (FileNotFoundError, NotADirectoryError):
                 return None
 
         try:

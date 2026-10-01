@@ -8,7 +8,7 @@
 
 | 由谁负责 | 内容 |
 | --- | --- |
-| **taifeng**（内核） | 协议：`CommandExecutor`、`ScriptExecutor`、`WorkspaceFS`（待落地）；工具层保证：审批、命令黑名单、env 白名单、超时、输出截断、取消 |
+| **taifeng**（内核） | 协议：`CommandExecutor`、`ScriptExecutor`、`WorkspaceFS`；工具层保证：审批、命令黑名单、env 白名单、超时、输出截断、取消，以及文件类工具的路径规则与上限 |
 | **taifeng-sandbox**（本仓） | 协议的隔离实现：进程在哪里、以什么隔离方式运行 |
 | **上层平台** | 按租户 / 会话分配沙盒、配额、出网策略的配置 |
 
@@ -53,6 +53,7 @@ pool = await taifeng.EnginePool.create(
 ```python
 from pathlib import Path
 
+import taifeng
 from taifeng_sandbox import shell_script_executor
 from taifeng_sandbox.docker import DockerEnvironment, DockerSandboxConfig, Mount
 
@@ -67,6 +68,11 @@ config = DockerSandboxConfig(
 async with await DockerEnvironment.create(config) as sandbox:
     scripts = shell_script_executor(sandbox.executor())
     await sandbox.workspace().write_text("input.txt", "...")
+    # 内核的文件类工具读写容器里的文件，与容器里跑的命令看到同一份
+    file_tools = [
+        taifeng.make_file_read_tool(workspace=sandbox.workspace()),
+        taifeng.make_file_write_tool(workspace=sandbox.workspace()),
+    ]
 ```
 
 隔离后端不可用时构造即失败（`SandboxUnavailableError`），不会退回无隔离执行。
@@ -90,7 +96,7 @@ transport = await StdioTransport.spawn(
 )
 client = await DaemonClient.connect(transport)     # 握手并核对协议版本（PROTOCOL_VERSION）
 executor = DaemonCommandExecutor(client)           # 实现 taifeng.CommandExecutor；stdin=True 时返回流式进程
-workspace = DaemonWorkspace(client)                # 文件访问，返回 FileMetadata / DirectoryEntry
+workspace = DaemonWorkspace(client)                # 实现 taifeng.WorkspaceFS；交给文件类工具的 workspace=
 ```
 
 线协议见 [ADR 0003](docs/decisions/0003-protocol-v1-and-trust-boundaries.md)。

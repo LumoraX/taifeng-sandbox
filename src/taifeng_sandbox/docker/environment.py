@@ -129,7 +129,7 @@ class DockerEnvironment:
         return DaemonCommandExecutor(self._client, default_cwd=self._config.workdir)
 
     def workspace(self) -> DaemonWorkspace:
-        """容器工作目录的文件视图。"""
+        """容器工作目录的文件视图（``taifeng.WorkspaceFS``），可交给文件类工具。"""
         return DaemonWorkspace(self._client)
 
     async def close(self) -> None:

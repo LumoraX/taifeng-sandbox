@@ -102,18 +102,20 @@
 
 ### 文件方法
 
-路径可以是绝对路径或相对根目录的路径。**解析符号链接之后必须仍在根目录之内**，否则 `-32020`。
+路径可以是绝对路径或相对根目录的路径。**解析符号链接之后必须仍在根目录之内**，否则 `-32024`。
 
 | 方法 | 参数 | 返回 |
 | --- | --- | --- |
 | `fs/readFile` | `path`；可选 `offset`（默认 0）、`length`（默认且最大 16 MiB） | `data`（base64）、`size`（文件总大小）、`eof` |
 | `fs/writeFile` | `path`、`data`（base64，单次最大 16 MiB）；可选 `append`、`createParents` | `bytesWritten` |
-| `fs/readDirectory` | `path` | `entries`：每项 `name`、`isDirectory`、`isFile`、`isSymlink` |
-| `fs/getMetadata` | `path` | 不存在时 `{"exists": false}`；存在时另有 `isDirectory`、`isFile`、`size`、`modifiedAt` |
+| `fs/readDirectory` | `path` | `entries`：每项 `name`、`isDirectory`、`isFile`、`isSymlink`（不跟随符号链接判定），按名字排序 |
+| `fs/getMetadata` | `path` | 不存在（含路径中间某一段是文件）时 `{"exists": false}`；存在时另有 `isDirectory`、`isFile`、`size`、`modifiedAt`（跟随符号链接） |
 | `fs/createDirectory` | `path`；可选 `recursive`（连同父目录，已存在不算错） | `{}` |
-| `fs/remove` | `path`；可选 `recursive` | `{}`。根目录本身不允许删 |
+| `fs/remove` | `path`；可选 `recursive` | `{}`。根目录本身不允许删（`-32020`）；非空目录不给 `recursive` 是 `-32022` |
 
-大文件用 `offset` / `length` 分段读、用 `append` 分段写。
+`fs/writeFile` 不给 `append` 时是**原子的整文件替换**：守护进程在目标所在目录写一个 `.tmp-` 开头的临时文件，写完再改名到目标，读者只会看到旧内容或新内容；失败时删掉临时文件。替换后的权限与直接写入一致：覆盖保持原文件的权限（可执行位不丢），新建按守护进程的 umask。`append` 为真时直接追加，不经临时文件。`path` 是根目录本身时是 `-32022`（不会在根目录之外建临时文件）。
+
+大文件用 `offset` / `length` 分段读、用 `append` 分段写。分段写只有第一段是原子替换，整体不是原子的。
 
 ## 错误码
 
@@ -130,12 +132,13 @@
 | `-32011` | 进程启动失败 |
 | `-32012` | `processId` 已存在 |
 | `-32013` | 没有这个进程 |
-| `-32020` | 路径在根目录之外，或没有权限 |
+| `-32020` | 没有权限：操作系统拒绝访问，或要删除根目录本身 |
 | `-32021` | 文件或目录不存在 |
 | `-32022` | 其他读写错误 |
 | `-32023` | 超过大小上限 |
+| `-32024` | 路径（解析符号链接之后）在根目录之外 |
 
-宿主侧客户端把错误响应变成 `SandboxRemoteError`（带 `code`）；`DaemonWorkspace` 进一步把 `-32021` 还原成 `FileNotFoundError`、`-32020` 还原成 `PermissionError`。
+宿主侧客户端把错误响应变成 `SandboxRemoteError`（带 `code`）；`DaemonWorkspace` 进一步把 `-32021` 还原成 `FileNotFoundError`、`-32024` 还原成 `taifeng.WorkspacePathError`、`-32020` 还原成 `PermissionError`（前者是后者的子类）。
 
 ## 版本
 
@@ -143,5 +146,5 @@
 
 | 版本 | 相对上一版的变化 |
 | --- | --- |
-| `2` | 进程可以接标准输入：`process/start` 新增 `stdin` 参数；新增 `process/write`、`process/closeStdin` |
+| `2` | 进程可以接标准输入：`process/start` 新增 `stdin` 参数；新增 `process/write`、`process/closeStdin`。路径越界从 `-32020` 中分出来，单独用 `-32024`；`fs/writeFile` 的整文件写入改为原子替换；`fs/getMetadata` 遇到路径中间某一段是文件时返回 `{"exists": false}` |
 | `1` | 初版 |

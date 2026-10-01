@@ -8,15 +8,13 @@ from taifeng_sandbox.daemon.process import RemoteProcess
 from taifeng_sandbox.daemon.protocol import PROTOCOL_VERSION
 from taifeng_sandbox.daemon.streaming import StreamingRemoteProcess
 from taifeng_sandbox.daemon.transport import StdioTransport, Transport
-from taifeng_sandbox.daemon.workspace import DaemonWorkspace, DirectoryEntry, FileMetadata
+from taifeng_sandbox.daemon.workspace import DaemonWorkspace
 
 __all__ = [
     "PROTOCOL_VERSION",
     "DaemonClient",
     "DaemonCommandExecutor",
     "DaemonWorkspace",
-    "DirectoryEntry",
-    "FileMetadata",
     "RemoteProcess",
     "StdioTransport",
     "StreamingRemoteProcess",
