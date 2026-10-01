@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -56,7 +57,63 @@ def test_deny_rules_come_last() -> None:
 def test_network_rules_only_when_enabled() -> None:
     """出网开关控制网络规则是否出现。"""
     enabled = seatbelt.build_profile(SandboxPolicy(network=True))
-    assert "(allow network-outbound)" in enabled
+    assert "(allow network-outbound (remote ip))" in enabled
+    disabled = seatbelt.build_profile(SandboxPolicy())
+    assert "network-outbound" not in disabled
+    assert "network-inbound" not in disabled
+
+
+def test_network_outbound_only_ip_and_dns_socket() -> None:
+    """出网只放行 IP 远端与 DNS 用的 mDNSResponder 套接字，其余 Unix 套接字不放行。"""
+    profile = seatbelt.build_profile(SandboxPolicy(network=True))
+    lines = [line.strip() for line in profile.splitlines()]
+    assert "(allow network-outbound)" not in lines
+    assert "(allow network-inbound)" not in lines
+    assert "(allow network*)" not in lines
+    assert [line for line in lines if "unix-socket" in line] == [
+        '(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))'
+    ]
+    assert "(allow network-inbound (local ip))" in lines
+
+
+# 读其他进程的信息、参数与环境，或读启动参数的 sysctl：一项都不能落进白名单
+_FORBIDDEN_SYSCTLS = (
+    "kern.procargs",
+    "kern.procargs2",
+    "kern.proc.pid.1",
+    "kern.proc.all",
+    "kern.proc.pgrp.1",
+    "kern.proc.uid.501",
+    "kern.bootargs",
+)
+
+
+@pytest.mark.parametrize("name", _FORBIDDEN_SYSCTLS)
+def test_sysctl_allowlist_excludes_process_and_boot_args(name: str) -> None:
+    """白名单的精确名字与前缀都覆盖不到读其他进程参数、环境的项。"""
+    assert name not in seatbelt.SYSCTL_READ_NAMES
+    prefixes = seatbelt.SYSCTL_READ_PREFIXES + seatbelt.SYSCTL_READ_NETWORK_PREFIXES
+    assert [prefix for prefix in prefixes if name.startswith(prefix)] == []
+
+
+@pytest.mark.parametrize("network", [False, True])
+def test_sysctl_read_is_allowlisted(network: bool) -> None:
+    """配置里只有逐项放行的 sysctl 读取，没有整体放开，也没有写；网卡列表只在出网时放行。"""
+    profile = seatbelt.build_profile(SandboxPolicy(network=network))
+    lines = [line.strip() for line in profile.splitlines()]
+    assert "(allow sysctl-read)" not in lines
+    assert "sysctl-write" not in profile
+    assert "sysctl-name-regex" not in profile
+    rules = re.findall(r'\((sysctl-name(?:-prefix)?) "([^"]+)"\)', profile)
+    prefixes = seatbelt.SYSCTL_READ_PREFIXES
+    if network:
+        prefixes += seatbelt.SYSCTL_READ_NETWORK_PREFIXES
+    assert sorted(rules) == sorted(
+        [("sysctl-name", name) for name in seatbelt.SYSCTL_READ_NAMES]
+        + [("sysctl-name-prefix", prefix) for prefix in prefixes]
+    )
+    assert "kern.osversion" in seatbelt.SYSCTL_READ_NAMES
+    assert "hw." in seatbelt.SYSCTL_READ_PREFIXES
 
 
 def test_argv_layout() -> None:

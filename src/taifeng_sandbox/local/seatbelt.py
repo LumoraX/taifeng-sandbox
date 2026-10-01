@@ -3,10 +3,15 @@
 参照 codex ``sandboxing/src/seatbelt.rs`` 与 ``seatbelt_base_policy.sbpl``（Apache-2.0）：
 默认全拒、子进程继承、根目录经 ``-D`` 参数传入而不是拼进配置文本。差异：
 
-- 基础配置是本仓自写的精简版，只放开进程运行必需的能力；``sysctl-read`` 整体放开
-  （codex 逐项列举），换取不同 macOS 版本下的兼容性；
+- 基础配置是本仓自写的精简版，只放开进程运行必需的能力；
+- ``sysctl-read`` 与 codex 一样逐项放行（``SYSCTL_READ_NAMES`` / ``SYSCTL_READ_PREFIXES``），
+  清单取 codex 基础策略与 macOS 自带的 App Sandbox 配置
+  （``/System/Library/Sandbox/Profiles/container.sb``）里只读系统信息的那些项；不同于 codex，
+  不放行 ``kern.proc.pid.*`` / ``kern.proc.pgrp.*``（ADR 0005 决策 2）。它挡不住沙盒读其他
+  进程的参数与环境（内核对那一项不走沙盒检查），那是已知限制；
 - 不可读目录用排在最后的 ``deny`` 规则表达（seatbelt 以最后匹配的规则为准）；
-- 不处理代理、证书、Unix socket 白名单——出网只有开 / 关两档。
+- 不处理代理与证书；出网档只放行 IP 远端与 DNS 用的 mDNSResponder 套接字，其余 Unix 套接字
+  一律拒绝（codex 出网档不加过滤，ADR 0005 决策 3）。
 
 本模块只做纯计算（拼配置与参数），不启动进程，便于单测。
 """
@@ -22,8 +27,62 @@ if TYPE_CHECKING:
 
 DEFAULT_SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 
+# 放行读取的 sysctl（精确名字）：运行时探测硬件、内核与系统版本用的只读信息项（ADR 0005 决策 2）。
+#
+# 逐项放行，不放行 ``kern.proc.*``（进程列表与进程信息）、``kern.procargs*``、``kern.bootargs``
+# （启动参数）等；App Sandbox 也只对苹果签名的程序放行这几类。
+#
+# 注意：这挡不住沙盒读同一用户下其他进程的参数与环境。内核对 ``KERN_PROCARGS2`` 与按 pid 的
+# ``KERN_PROC_PID`` 不走沙盒的 sysctl 检查，连 ``(deny default)`` 也拦不住（macOS 26.6.2 实测），
+# 这是 macOS 本机后端的已知限制，见 ADR 0005 决策 2。
+SYSCTL_READ_NAMES: tuple[str, ...] = (
+    "kern.argmax",
+    "kern.boottime",
+    "kern.clockrate",
+    "kern.hostname",
+    "kern.hv_vmm_present",
+    "kern.iossupportversion",
+    "kern.maxfiles",
+    "kern.maxfilesperproc",
+    "kern.maxproc",
+    "kern.ngroups",
+    "kern.osproductversion",
+    "kern.osrelease",
+    "kern.ostype",
+    "kern.osvariant_status",
+    "kern.osversion",
+    "kern.safeboot",
+    "kern.secure_kernel",
+    "kern.usrstack64",
+    "kern.version",
+    "machdep.ptrauth_enabled",
+    "machdep.virtual_address_size",
+    "security.mac.lockdown_mode_state",
+    # 按名字查询要先把名字换成 OID（``sysctl`` 命令行等）
+    "sysctl.name2oid",
+    "sysctl.proc_cputype",
+    "sysctl.proc_native",
+    "sysctl.proc_translated",
+    "vm.loadavg",
+)
+
+# 放行读取的 sysctl（名字前缀）：硬件信息、CPU 型号与特性；``sysctl`` 命令行按 OID 反查名字与类型
+SYSCTL_READ_PREFIXES: tuple[str, ...] = ("hw.", "machdep.cpu.", "sysctl.name.", "sysctl.oidfmt.")
+
+
+# 出网时额外放行读取的 sysctl（名字前缀）：网卡与地址列表（``getifaddrs``），codex 出网档同样放行
+SYSCTL_READ_NETWORK_PREFIXES: tuple[str, ...] = ("net.routetable.",)
+
+
+def _sysctl_rules(names: tuple[str, ...], prefixes: tuple[str, ...]) -> str:
+    """逐项放行 sysctl 读取的 SBPL 规则。"""
+    rules = [f'  (sysctl-name "{name}")' for name in names]
+    rules += [f'  (sysctl-name-prefix "{prefix}")' for prefix in prefixes]
+    return "(allow sysctl-read\n" + "\n".join(rules) + ")"
+
+
 # 进程运行必需的基础能力：默认全拒，再逐项放开
-_BASE_PROFILE = """\
+_BASE_PROFILE = f"""\
 (version 1)
 (deny default)
 
@@ -33,8 +92,8 @@ _BASE_PROFILE = """\
 (allow signal (target same-sandbox))
 (allow process-info* (target same-sandbox))
 
-; 运行时探测硬件 / 内核信息
-(allow sysctl-read)
+; 运行时探测硬件 / 内核信息：逐项放行，不含进程列表与启动参数
+{_sysctl_rules(SYSCTL_READ_NAMES, SYSCTL_READ_PREFIXES)}
 
 ; 标准设备
 (allow file-read* file-write-data file-ioctl
@@ -73,11 +132,18 @@ _SYSTEM_READABLE_ROOTS: tuple[str, ...] = (
     "/Applications/Xcode.app",
 )
 
-_NETWORK_PROFILE = """\
-; 出网：放开套接字与解析 / 证书校验依赖的系统服务
-(allow network-outbound)
-(allow network-inbound)
+# DNS：系统解析器经这个 Unix 套接字找 mDNSResponder（/var/run 指向 /private/var/run）
+_DNS_SOCKET = "/private/var/run/mDNSResponder"
+
+_NETWORK_PROFILE = f"""\
+; 出网：只放行 IP 远端（含本机回环）与 DNS 用的 mDNSResponder 套接字。
+; 不加过滤的 network-outbound 会连带放开本机所有 Unix 套接字：Docker 守护进程（等于接管宿主）、
+; ssh-agent、本地数据库都连得上。这里没放行的 Unix 套接字一律拒绝，包括绑定。
+(allow network-outbound (remote ip))
+(allow network-outbound (remote unix-socket (path-literal "{_DNS_SOCKET}")))
+(allow network-inbound (local ip))
 (allow system-socket)
+{_sysctl_rules((), SYSCTL_READ_NETWORK_PREFIXES)}
 (allow mach-lookup
   (global-name "com.apple.bsd.dirhelper")
   (global-name "com.apple.system.opendirectoryd.membership")
@@ -163,4 +229,12 @@ def build_argv(
     return argv
 
 
-__all__ = ["DEFAULT_SANDBOX_EXEC", "build_argv", "build_params", "build_profile"]
+__all__ = [
+    "DEFAULT_SANDBOX_EXEC",
+    "SYSCTL_READ_NAMES",
+    "SYSCTL_READ_NETWORK_PREFIXES",
+    "SYSCTL_READ_PREFIXES",
+    "build_argv",
+    "build_params",
+    "build_profile",
+]

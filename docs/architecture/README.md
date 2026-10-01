@@ -61,6 +61,10 @@ taifeng 工具层（审批 / 黑名单 / env 白名单 / 超时 / 截断 / 取�
 
 本机后端的启动器（沙盒外的 `bwrap` 进程）本身不受被隔离一方影响：它只拿固定的空环境、工作目录固定为 `/`；`CommandSpec.env` 经 `--args` 读取的封口 memfd 以 `--setenv` 交给 bwrap，只在沙盒里的目标进程上生效，值也不进命令行（[ADR 0005](../decisions/0005-local-launcher-and-seatbelt-hardening.md) 决策 1）。
 
+seatbelt 配置逐项放行 sysctl（不含进程列表与启动参数），出网时只放行 IP 远端与 DNS 用的 mDNSResponder 套接字，本机其他 Unix 套接字（Docker 守护进程、ssh-agent、本地数据库）一律连不上（ADR 0005 决策 2、3）。
+
+**macOS 本机后端不是对抗性隔离。** 沙盒里的进程仍能读到同一用户下所有非平台进程的完整参数与初始环境（`KERN_PROCARGS2`，seatbelt 管不到，见 ADR 0005 决策 2）；出网时能连本机任意 TCP 端口。运行不受信任的命令时，宿主不要把密钥放在同用户进程的环境变量里，或让命令以另一个系统用户运行，或改用容器后端。
+
 ## 组件状态
 
 | 组件 | extra | 状态 | 验证方式 |
@@ -99,10 +103,13 @@ docker run --rm --privileged \
 
 - 经守护进程执行时，`CommandSpec.stdin=False` 的命令在进程结束后一次性取回输出；`stdin=True` 时是流式的（标准输入持续写、输出边到边读，见 [`StreamingRemoteProcess`](reference.md#streamingremoteprocess)），每路未读输出有上限，超限强杀进程并报错。
 - bubblewrap 后端只用命名空间与挂载，没有叠加 seccomp、Landlock。
-- 同一用户的其他进程能读到沙盒里目标进程的环境（`/proc/<pid>/environ`），与不隔离执行相同；需要对同用户隐藏密钥时，换用独立用户或容器后端。
+- 同一用户的其他进程能读到沙盒里目标进程的环境（Linux `/proc/<pid>/environ`），与不隔离执行相同；需要对同用户隐藏密钥时，换用独立用户或容器后端。
+- seatbelt 沙盒里的进程能读到同一用户下所有非平台进程的完整参数与初始环境（`KERN_PROCARGS2`；连 `(deny default)` 也挡不住，macOS 26.6.2 实测），也能按 pid 查单个进程的基本信息；进程列表、启动参数等其他 sysctl 被拒（ADR 0005 决策 2）。
+- seatbelt 出网时只放行 IP 远端与 mDNSResponder 套接字：本机任意 TCP 端口（监听在回环上的数据库、开了 TCP 接口的 Docker 等）仍然连得上；需要自己建 Unix 套接字的程序会失败，`socketpair` 不受影响（ADR 0005 决策 3）。bubblewrap 后端不过滤 Unix 套接字：文件系统里的套接字只要所在目录被挂进沙盒就连得上，与是否出网无关（只读挂载挡不住连接；全盘可读时宿主的套接字都在，受限读时只有列出的目录里的）；出网时共享宿主网络命名空间，宿主的抽象 Unix 套接字也连得上（容器里实测）。在 Linux 上运行不受信任的命令请用受限读，且不要把放着宿主服务套接字的目录列为可读。
+- seatbelt 启动器 `sandbox-exec` 拿到完整的 `CommandSpec.env`，依赖 SIP 让 dyld 忽略并删掉其中的 `DYLD_*`：目标进程也看不到 `DYLD_*`；关掉 SIP 的机器不能当作隔离边界（ADR 0005 决策 4）。
 - bubblewrap 后端 `CommandSpec.cwd=None` 时取宿主进程当前目录，沙盒里看不到它就启动失败（bwrap 报错退出）。
 - seatbelt 的受限读模式允许对任意路径取元数据（不含内容与目录列表），否则进程无法沿父目录打开深层文件。
-- 出网只有开、关两档，没有域名白名单与出网代理。
+- 出网只有开、关两档，没有域名白名单与出网代理；seatbelt 的「开」不含本机 Unix 套接字。
 - 容器后端要求镜像里有 Python 3.9+。
 - 经 `DaemonWorkspace` 写入超过 16 MiB 的文件不是原子的：线协议单次最多 16 MiB，第一段原子替换，之后逐段追加；线协议没有 rename。读取超过 16 MiB 的文件同样分段，不是快照：读的过程中文件被改，结果可能新旧混杂。
 - 整文件写入是原子替换，代价是：父目录必须可写；断开硬链接；非 root 守护进程覆盖后属主变为守护进程的用户（root 时保持原属主）；只读文件可以被覆盖；单文件 bind mount 的目标得到 `EBUSY`；并发遍历能短暂看到 `.tmp-*`，守护进程中途被杀会残留；不 `fsync`（ADR 0004 决策 8）。

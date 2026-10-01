@@ -48,9 +48,11 @@
 | --- | --- | --- |
 | 读范围 | 配置文件里的允许规则 | 只挂载允许的目录 |
 | 写范围 | 同上 | 可写目录以读写方式挂载，其余只读 |
-| 出网 | 拒绝网络操作 | `--unshare-net` |
+| 出网 | 关：拒绝网络操作。开：只放行 IP 远端（含本机回环）与 DNS 用的 mDNSResponder 套接字，其余 Unix 套接字连接、绑定都拒绝 | 关：`--unshare-net`。开：共享宿主网络 |
 | 命名空间 | 无 | 用户、进程、IPC 各自独立；`network=False` 时网络也独立 |
-| 已知差异 | 受限读模式下仍可对任意路径取元数据（不含内容） | 没有叠加 seccomp、Landlock |
+| sysctl | 逐项放行只读的系统信息项（`seatbelt.SYSCTL_READ_NAMES` / `SYSCTL_READ_PREFIXES`，出网时加 `SYSCTL_READ_NETWORK_PREFIXES`） | 不限制（进程命名空间独立，看不到宿主进程） |
+| 启动器 | `sandbox-exec` 拿 `CommandSpec.env`（SIP 让它忽略并删掉 `DYLD_*`） | `bwrap` 只拿空环境、工作目录 `/` |
+| 已知差异 | 受限读模式下仍可对任意路径取元数据（不含内容）；能读到同一用户下非平台进程的参数与环境 | 没有叠加 seccomp、Landlock |
 
 ## 脚本执行：`SandboxedScriptExecutor`
 
