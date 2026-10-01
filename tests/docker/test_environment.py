@@ -120,6 +120,22 @@ async def test_workspace_files_visible_to_commands(sandbox: DockerEnvironment) -
     assert (await workspace.read_text("output.txt")).strip() == "from-box"
 
 
+async def test_root_daemon_overwrites_without_cap_chown(sandbox: DockerEnvironment) -> None:
+    """容器里守护进程是 root 但没有任何 capability：覆盖自己的文件照常成功，权限位与属主保持。
+
+    走的是守护进程 euid 为 0 的分支：原属主与临时文件属主相同，不调 ``fchown``。
+    """
+    workspace = sandbox.workspace()
+    await workspace.write_text("run.sh", "echo old\n")
+    code, _, _ = await _run(sandbox.executor(), "chmod 750 run.sh")
+    assert code == 0
+    await workspace.write_text("run.sh", "echo new\n")
+    code, out, _ = await _run(sandbox.executor(), "stat -c '%u:%g %a' run.sh; ls -A")
+    assert code == 0
+    assert out.split() == ["0:0", "750", "run.sh"]
+    assert await workspace.read_text("run.sh") == "echo new\n"
+
+
 async def test_file_access_confined_to_workdir(sandbox: DockerEnvironment) -> None:
     """文件接口出不了工作区，哪怕目标在容器里。"""
     with pytest.raises(PermissionError):

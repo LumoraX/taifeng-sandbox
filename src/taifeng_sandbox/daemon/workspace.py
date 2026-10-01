@@ -76,24 +76,28 @@ class DaemonWorkspace:
         """守护进程根目录的真实路径（握手时上报）；``resolve`` 返回的规范路径都以它为前缀。
 
         Raises:
-            SandboxProtocolError: 握手信息里没有根目录。
+            SandboxProtocolError: 握手信息里没有根目录，或它不是规范的绝对路径。
         """
         root = self._client.server_info.get("root")
-        if not isinstance(root, str) or not root:
+        if not isinstance(root, str):
             raise SandboxProtocolError("守护进程的握手信息里没有根目录（root）")
+        if not root.startswith("/") or root.startswith("//") or posixpath.normpath(root) != root:
+            raise SandboxProtocolError(f"守护进程上报的根目录不是规范的绝对路径：{root!r}")
         return root
 
     def resolve(self, path: str) -> str:
         """把路径规范成沙盒里的绝对路径（纯路径计算，不发请求）。
 
-        相对路径相对根目录；``..`` 按字面折叠（``posixpath.normpath``），**不跟随符号链接**——
-        根内指向根外的链接在这里放行，由守护进程按真实路径再校验时拦下。
+        相对路径相对根目录；``..`` 按字面折叠（``posixpath.normpath``），开头的多个 ``/`` 规整成
+        一个；**不跟随符号链接**——根内指向根外的链接在这里放行，由守护进程按真实路径再校验时拦下。
 
         Raises:
             taifeng.WorkspacePathError: 路径落在根目录之外。
         """
         root = self.root
         resolved = posixpath.normpath(posixpath.join(root, path))
+        if resolved.startswith("//"):  # normpath 按 POSIX 保留恰好两个开头的 /
+            resolved = "/" + resolved.lstrip("/")
         if resolved != root and not resolved.startswith(root.rstrip("/") + "/"):
             raise taifeng.WorkspacePathError(f"{path} 在沙盒根目录之外（{root}）")
         return resolved

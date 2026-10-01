@@ -18,8 +18,10 @@ if TYPE_CHECKING:
     import taifeng
 
 # 输出流的单行读取上限，也决定读缓冲暂停读取的水位（2 倍于它）。asyncio 默认 64 KiB：经本机执行器
-# 起的 MCP 连接器单条响应超过它时，内核的 readline 抛 ValueError，读循环随之崩掉。取值与守护进程单次
-# 读写的上限（``daemon.protocol.MAX_FILE_BYTES``）对齐，两类后端能交出的单条消息一样大。
+# 起的 MCP 连接器单条响应超过它时，内核的 readline 抛 ValueError，读循环随之崩掉。取值与守护进程
+# 执行器每路未读字节的默认上限（``daemon.process.DEFAULT_MAX_BUFFER_BYTES``）对齐——远端流式进程
+# 一行也得整行放进那个缓冲才读得出——两类后端能交出的单行一样长。不 import 它，免得本机后端依赖
+# 守护进程包；``tests/local/test_streaming.py`` 守护两边一致。
 STREAM_LIMIT_BYTES = 16 * 1024 * 1024
 
 

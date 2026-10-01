@@ -127,8 +127,11 @@ class PathGuard:
         """解析为真实路径并确认没有逃出根目录。
 
         相对路径相对根目录解释。目标不存在时 ``realpath`` 仍会解析已存在的那部分父目录，
-        所以借符号链接指向根外的写入同样会被拦下。
+        所以借符号链接指向根外的写入同样会被拦下。路径里有 NUL 是参数错误：显式检查，因为 3.9 的
+        ``realpath`` 不报错、要到之后打开文件时才抛 ``ValueError``。
         """
+        if "\x00" in requested:
+            raise RpcError(ERROR_INVALID_PARAMS, "路径里不能有 NUL 字符：%r" % requested)
         candidate = requested if os.path.isabs(requested) else os.path.join(self.root, requested)
         real = os.path.realpath(candidate)
         if real != self.root and not real.startswith(self.root.rstrip(os.sep) + os.sep):
@@ -145,14 +148,41 @@ def _map_os_error(exc: OSError, path: str) -> RpcError:
     return RpcError(ERROR_IO, "%s：%s" % (path, exc.strerror or str(exc)))
 
 
+def _atomic_replace(
+    path: str, data: bytes, mode: int, owner: Optional[Tuple[int, int]]
+) -> None:
+    """同目录写 ``.tmp-`` 临时文件，在它的 fd 上设好权限（与属主），再 ``os.replace`` 到 ``path``。
+
+    读者只会看到旧内容或新内容；任何一步失败都删掉临时文件、目标不动。``owner`` 为 None 时不改属主；
+    与临时文件现有属主相同时也不调 ``fchown``（没有 ``CAP_CHOWN`` 的 root 也能照常覆盖自己的文件）。
+    """
+    fd, temp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()  # 数据先落进文件再设权限：之后不再有写入去改动权限位
+            current = os.fstat(handle.fileno())
+            if owner is not None and owner != (current.st_uid, current.st_gid):
+                os.fchown(handle.fileno(), owner[0], owner[1])
+            os.fchmod(handle.fileno(), mode)
+        os.replace(temp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):  # 清理失败不掩盖原始错误
+            os.unlink(temp)
+        raise
+
+
 class FileService:
     """文件访问方法。磁盘 IO 放到线程池，不阻塞事件循环。"""
 
-    def __init__(self, guard: PathGuard) -> None:
-        """绑定路径守卫，并记下 umask（只能「设置并取回旧值」；此时还没有工作线程在建文件）。"""
+    def __init__(self, guard: PathGuard, umask: int) -> None:
+        """
+        Args:
+            guard: 路径守卫。
+            umask: 守护进程启动时读到的 umask，新建文件按它设权限。
+        """
         self._guard = guard
-        self._umask = os.umask(0o077)
-        os.umask(self._umask)
+        self._umask = umask
 
     async def read_file(self, params: Params) -> Dict[str, Any]:
         """读文件；支持 ``offset`` / ``length`` 分段读取大文件。"""
@@ -181,9 +211,7 @@ class FileService:
     async def write_file(self, params: Params) -> Dict[str, Any]:
         """写文件；``append`` 追加，``createParents`` 自动建父目录。
 
-        非追加写入是原子的：同目录写临时文件，再 ``os.replace`` 到目标，读者只会看到旧内容或新内容；
-        失败时删掉临时文件。``mkstemp`` 建出的 0600 不带到目标上：覆盖保持原权限（可执行位不丢），
-        新建按 umask，与直接 ``open`` 写入的结果一致。
+        非追加写入是原子的（见 ``_atomic_replace``），权限与属主见 ``_replacement``。
         """
         path = self._guard.resolve(_require_str(params, "path"))
         if path == self._guard.root:
@@ -195,8 +223,8 @@ class FileService:
             raise RpcError(ERROR_INVALID_PARAMS, "data 不是合法的 base64") from exc
         if len(data) > MAX_FILE_BYTES:
             raise RpcError(ERROR_TOO_LARGE, "单次写入超过上限")
-        append = bool(params.get("append"))
-        create_parents = bool(params.get("createParents"))
+        append = _optional_bool(params, "append")
+        create_parents = _optional_bool(params, "createParents")
 
         def _write() -> None:
             if create_parents:
@@ -205,16 +233,7 @@ class FileService:
                 with open(path, "ab") as handle:
                     handle.write(data)
                 return
-            fd, temp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
-            try:
-                with os.fdopen(fd, "wb") as handle:
-                    handle.write(data)
-                os.chmod(temp, self._replaced_mode(path))
-                os.replace(temp, path)
-            except BaseException:
-                with contextlib.suppress(OSError):  # 清理失败不掩盖原始错误
-                    os.unlink(temp)
-                raise
+            _atomic_replace(path, data, *self._replacement(path))
 
         try:
             await asyncio.get_event_loop().run_in_executor(None, _write)
@@ -222,12 +241,22 @@ class FileService:
             raise _map_os_error(exc, path) from exc
         return {"bytesWritten": len(data)}
 
-    def _replaced_mode(self, path: str) -> int:
-        """原子替换后目标的权限：已存在保持原权限，新建按 umask。"""
+    def _replacement(self, path: str) -> Tuple[int, Optional[Tuple[int, int]]]:
+        """原子替换后目标的权限位与属主，免得 ``mkstemp`` 的 0600 与守护进程身份带到目标上。
+
+        覆盖：保持原文件的 ``rwx`` 权限位（只取 ``& 0o777``，setuid / setgid / sticky 不保留）；
+        守护进程以 root 运行时还保持原属主，非 root 改不了属主，覆盖后属主是守护进程的用户。
+        root 却没有 ``CAP_CHOWN``（容器去掉了全部 capability）而原属主是别人时，``fchown``
+        失败、整次写入报 ``-32020``，目标不动——不悄悄改掉属主。
+
+        新建：权限按 umask（与直接 ``open`` 一致），属主不动。
+        """
         try:
-            return stat.S_IMODE(os.stat(path).st_mode)
+            info = os.stat(path)
         except FileNotFoundError:
-            return 0o666 & ~self._umask
+            return 0o666 & ~self._umask, None
+        owner = (info.st_uid, info.st_gid) if os.geteuid() == 0 else None
+        return info.st_mode & 0o777, owner
 
     async def read_directory(self, params: Params) -> Dict[str, Any]:
         """列目录（不递归），按名字排序。"""
@@ -280,7 +309,7 @@ class FileService:
     async def create_directory(self, params: Params) -> Dict[str, Any]:
         """建目录；``recursive`` 连同父目录一起建，已存在不算错。"""
         path = self._guard.resolve(_require_str(params, "path"))
-        recursive = bool(params.get("recursive"))
+        recursive = _optional_bool(params, "recursive")
 
         def _mkdir() -> None:
             if recursive:
@@ -299,7 +328,7 @@ class FileService:
         path = self._guard.resolve(_require_str(params, "path"))
         if path == self._guard.root:
             raise RpcError(ERROR_ACCESS_DENIED, "不允许删除沙盒根目录")
-        recursive = bool(params.get("recursive"))
+        recursive = _optional_bool(params, "recursive")
 
         def _remove() -> None:
             if os.path.isdir(path) and not os.path.islink(path):
@@ -553,8 +582,8 @@ def _kill_group(proc: asyncio.subprocess.Process) -> None:
 class Daemon:
     """消息循环：读请求、派发、写响应。"""
 
-    def __init__(self, root: str, writer: asyncio.StreamWriter) -> None:
-        """组装各项服务与方法表。"""
+    def __init__(self, root: str, writer: asyncio.StreamWriter, umask: int) -> None:
+        """组装各项服务与方法表；``umask`` 是启动时读到的值（见 ``main``）。"""
         self._guard = PathGuard(root)
         self._writer = writer
         self._write_lock = asyncio.Lock()
@@ -562,7 +591,7 @@ class Daemon:
         self._stopping = False
         self._tasks = set()  # type: set[asyncio.Future[None]]
         self._processes = ProcessService(self._guard, self._send_notification)
-        files = FileService(self._guard)
+        files = FileService(self._guard, umask)
         self._handlers = {
             "process/start": self._processes.start,
             "process/write": self._processes.write,
@@ -705,10 +734,10 @@ async def _open_stdio() -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
     return reader, writer
 
 
-async def _run(root: str) -> None:
+async def _run(root: str, umask: int) -> None:
     """启动守护进程并服务到连接结束。"""
     reader, writer = await _open_stdio()
-    await Daemon(root, writer).serve(reader)
+    await Daemon(root, writer, umask).serve(reader)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -719,7 +748,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not os.path.isdir(args.root):
         sys.stderr.write("daemon: 根目录不存在：%s\n" % args.root)
         return 2
-    asyncio.run(_run(args.root))
+    # umask 只能「设置并取回旧值」：在 asyncio.run 之前读，此时还没有任何线程在建文件
+    umask = os.umask(0o077)
+    os.umask(umask)
+    asyncio.run(_run(args.root, umask))
     return 0
 
 

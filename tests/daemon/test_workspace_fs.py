@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import base64
 import os
 import stat
 from typing import TYPE_CHECKING, Any, cast
@@ -84,11 +85,91 @@ async def test_out_of_root_access_raises_workspace_path_error(
     assert not (root.parent / "outside.txt").exists()
 
 
-async def test_daemon_reports_escape_with_its_own_error_code(client: DaemonClient) -> None:
-    """线协议层面：越界是 ``-32024``，与「操作系统拒绝访问」的 ``-32020`` 分开。"""
+# 绕过 DaemonWorkspace 直接发的文件请求：每个方法除 path 之外的参数
+_RAW_PARAMS: dict[str, dict[str, Any]] = {
+    protocol.METHOD_FS_READ_FILE: {},
+    protocol.METHOD_FS_WRITE_FILE: {"data": base64.b64encode(b"leak").decode(), "createParents": True},
+    protocol.METHOD_FS_REMOVE: {"recursive": True},
+    protocol.METHOD_FS_CREATE_DIRECTORY: {"recursive": True},
+    protocol.METHOD_FS_GET_METADATA: {},
+    protocol.METHOD_FS_READ_DIRECTORY: {},
+}
+
+
+def _plant_outside(root: Path) -> None:
+    """在根目录之外布置文件：父目录里的文件、同前缀的兄弟目录、根内链接指向的根外目录。"""
+    base = root.parent
+    (base / "outside.txt").write_text("s3cret")
+    (base / f"{root.name}-evil").mkdir()
+    (base / f"{root.name}-evil" / "f.txt").write_text("evil")
+    (base / "outside-dir").mkdir()
+    (base / "outside-dir" / "secret.txt").write_text("s3cret")
+    (root / "link").symlink_to(base / "outside-dir")
+
+
+def _outside_state(root: Path) -> dict[str, str]:
+    """根目录之外的全部条目与文件内容（不进根目录）。"""
+    state: dict[str, str] = {}
+    for dirpath, dirnames, filenames in os.walk(root.parent):
+        dirnames[:] = [name for name in dirnames if os.path.join(dirpath, name) != str(root)]
+        for name in dirnames:
+            state[os.path.relpath(os.path.join(dirpath, name), root.parent)] = "<dir>"
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            with open(path, encoding="utf-8") as handle:
+                state[os.path.relpath(path, root.parent)] = handle.read()
+    return state
+
+
+@pytest.mark.parametrize(
+    "escape",
+    ["../outside.txt", "a/../../outside.txt", "{root}-evil/f.txt", "link/secret.txt"],
+    ids=["dotdot", "nested-dotdot", "same-prefix-sibling", "symlink"],
+)
+async def test_daemon_rejects_escapes_on_its_own(
+    client: DaemonClient, root: Path, escape: str
+) -> None:
+    """守护进程是第二道防线：绕过客户端 resolve 直接发请求，六个文件方法越界一律 ``-32024``。
+
+    根外的文件一个字节都不变，也不多出东西。
+    """
+    _plant_outside(root)
+    before = _outside_state(root)
+    path = escape.format(root=root)
+    for method, extra in _RAW_PARAMS.items():
+        with pytest.raises(SandboxRemoteError) as caught:
+            await client.request(method, {"path": path, **extra})
+        assert caught.value.code == protocol.ERROR_OUTSIDE_ROOT == -32024, method
+    assert _outside_state(root) == before
+
+
+async def test_nul_in_path_is_invalid_params(client: DaemonClient) -> None:
+    """路径里有 NUL：每个文件方法都回参数错误 ``-32602``，不是内部错误。"""
+    for method, extra in _RAW_PARAMS.items():
+        with pytest.raises(SandboxRemoteError) as caught:
+            await client.request(method, {"path": "a\x00b", **extra})
+        assert caught.value.code == protocol.ERROR_INVALID_PARAMS, method
+
+
+@pytest.mark.parametrize(
+    ("method", "flag"),
+    [
+        (protocol.METHOD_FS_WRITE_FILE, "append"),
+        (protocol.METHOD_FS_WRITE_FILE, "createParents"),
+        (protocol.METHOD_FS_REMOVE, "recursive"),
+        (protocol.METHOD_FS_CREATE_DIRECTORY, "recursive"),
+    ],
+)
+async def test_non_boolean_flags_are_invalid_params(
+    client: DaemonClient, root: Path, method: str, flag: str
+) -> None:
+    """布尔开关给了非布尔值是参数错误，不按真假值宽松解释。"""
+    (root / "x").write_text("keep")
+    params = {"path": "x", **_RAW_PARAMS[method], flag: "yes"}
     with pytest.raises(SandboxRemoteError) as caught:
-        await client.request(protocol.METHOD_FS_READ_FILE, {"path": "/etc/passwd"})
-    assert caught.value.code == protocol.ERROR_OUTSIDE_ROOT == -32024
+        await client.request(method, params)
+    assert caught.value.code == protocol.ERROR_INVALID_PARAMS
+    assert (root / "x").read_text() == "keep"
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root 用户不受文件权限约束")
@@ -159,30 +240,42 @@ async def test_whole_file_write_is_atomic(client: DaemonClient, root: Path) -> N
 async def test_failed_whole_file_write_removes_the_temp_file(
     client: DaemonClient, root: Path, tmp_path: Path
 ) -> None:
-    """替换失败（目标是目录）时报错，临时文件被删掉；往根目录本身写不会在根外建临时文件。"""
+    """替换失败（目标是目录）时报错，临时文件被删掉；往根目录本身写同样报错，根外不多出文件。"""
     (root / "d").mkdir()
     ws = DaemonWorkspace(client)
     with pytest.raises(OSError):  # noqa: PT011 —— 具体子类随平台而异
         await ws.write_bytes("d", b"x")
     assert [p.name for p in root.iterdir()] == ["d"]
     assert list((root / "d").iterdir()) == []
-    # 根目录的父目录设为只读：若守护进程试图在那里建临时文件，得到的会是 -32020 而不是 -32022
+    with pytest.raises(SandboxRemoteError) as caught:
+        await ws.write_bytes(".", b"x")
+    assert caught.value.code == protocol.ERROR_IO
+    assert list(tmp_path.iterdir()) == [root]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root 用户不受目录权限约束，判别不了")
+async def test_writing_the_root_never_touches_its_parent(
+    client: DaemonClient, root: Path, tmp_path: Path
+) -> None:
+    """往根目录本身写，守护进程不会去根目录的父目录（根外）建临时文件。
+
+    父目录设为只读：若守护进程试图在那里建临时文件，得到的会是 -32020 而不是 -32022。
+    """
     tmp_path.chmod(0o555)
     try:
         with pytest.raises(SandboxRemoteError) as caught:
-            await ws.write_bytes(".", b"x")
+            await DaemonWorkspace(client).write_bytes(".", b"x")
         assert caught.value.code == protocol.ERROR_IO
     finally:
         tmp_path.chmod(0o755)
-    assert list(tmp_path.iterdir()) == [root]
 
 
 async def test_overwrite_keeps_mode_and_new_files_follow_umask(
     client: DaemonClient, root: Path
 ) -> None:
-    """临时文件的 0600 不带到目标上：覆盖保持原权限（可执行位不丢），新建按 umask。
+    """临时文件的 0600 不带到目标上：覆盖保持原 rwx 权限位（可执行位不丢），新建按 umask。
 
-    两种情形都与直接 ``open`` 写入的结果一致。
+    两种情形都与直接 ``open`` 写入的结果一致；setuid 这类特殊位不保留（只取 ``& 0o777``）。
     """
     ws = DaemonWorkspace(client)
     script = root / "run.sh"
@@ -190,8 +283,39 @@ async def test_overwrite_keeps_mode_and_new_files_follow_umask(
     script.chmod(0o755)
     await ws.write_bytes("run.sh", b"echo new\n")
     assert stat.S_IMODE(script.stat().st_mode) == 0o755
+    script.chmod(0o4755)
+    await ws.write_bytes("run.sh", b"echo newer\n")
+    assert stat.S_IMODE(script.stat().st_mode) == 0o755
     await ws.write_bytes("fresh.txt", b"x")
     assert stat.S_IMODE((root / "fresh.txt").stat().st_mode) == 0o666 & ~_umask()
+
+
+async def test_overwrite_keeps_the_owner_and_does_not_fail(
+    client: DaemonClient, root: Path
+) -> None:
+    """覆盖是替换（inode 变了），属主与属组不变，非 root 守护进程也不因属主报错。"""
+    target = root / "owned.txt"
+    target.write_text("old")
+    before = target.stat()
+    await DaemonWorkspace(client).write_bytes("owned.txt", b"new")
+    after = target.stat()
+    assert after.st_ino != before.st_ino
+    assert (after.st_uid, after.st_gid) == (before.st_uid, before.st_gid)
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="只有 root 守护进程能把属主改回原值")
+async def test_root_daemon_restores_the_original_owner(client: DaemonClient, root: Path) -> None:
+    """守护进程以 root 运行：覆盖后保持原属主与原权限；新建文件属主不动（就是 root）。"""
+    target = root / "owned.txt"
+    target.write_text("old")
+    os.chown(target, 12345, 23456)
+    target.chmod(0o640)
+    ws = DaemonWorkspace(client)
+    await ws.write_bytes("owned.txt", b"new")
+    info = target.stat()
+    assert (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) == (12345, 23456, 0o640)
+    await ws.write_bytes("fresh.txt", b"x")
+    assert (root / "fresh.txt").stat().st_uid == 0
 
 
 async def test_failures_are_standard_os_errors(client: DaemonClient, root: Path) -> None:
@@ -216,17 +340,69 @@ async def test_failures_are_standard_os_errors(client: DaemonClient, root: Path)
     assert not (root / "d").exists()
 
 
-def test_root_requires_handshake_info() -> None:
-    """握手信息里没有根目录：抛 SandboxProtocolError，不猜默认值。"""
+async def test_reading_a_directory_as_a_file_fails(client: DaemonClient, root: Path) -> None:
+    """把目录当文件读：是 OSError，但既不是「不存在」也不是「无权」；内核 file_read 报不是文件。"""
+    (root / "d").mkdir()
+    ws = DaemonWorkspace(client)
+    with pytest.raises(OSError) as caught:  # noqa: PT011 —— 具体子类随平台而异
+        await ws.read_bytes("d")
+    assert not isinstance(caught.value, FileNotFoundError | PermissionError)
+    result = await _call(taifeng.make_file_read_tool(workspace=ws), path="d")
+    assert result.is_error and result.data.get("reason") == "not_found"
 
-    class _NoRoot:
-        server_info: dict[str, Any] = {}  # noqa: RUF012 —— 只读的桩
 
-    ws = DaemonWorkspace(cast("DaemonClient", _NoRoot()))
+class _Canned:
+    """桩客户端：握手信息可定制，每个请求都返回同一份响应。"""
+
+    def __init__(self, response: dict[str, Any], root: object = "/work") -> None:
+        """记下要返回的响应与握手信息里的根目录。"""
+        self.server_info: dict[str, Any] = {"root": root}
+        self._response = response
+
+    async def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """不管发什么都返回同一份响应。"""
+        return self._response
+
+
+@pytest.mark.parametrize(
+    ("operation", "response"),
+    [
+        ("metadata", {"exists": True, "isFile": True}),
+        ("metadata", {"exists": "yes"}),
+        ("list_directory", {"entries": "a.txt"}),
+        ("list_directory", {"entries": ["a.txt"]}),
+        ("list_directory", {"entries": [{"name": "a.txt", "isDirectory": False, "isFile": True}]}),
+        ("read_bytes", {"data": 1, "eof": True}),
+        ("read_bytes", {"data": "aGk="}),
+        ("read_bytes", {"data": "not base64!", "eof": True}),
+    ],
+)
+async def test_malformed_responses_are_protocol_errors(
+    operation: str, response: dict[str, Any]
+) -> None:
+    """响应字段缺失或类型不对：SandboxProtocolError，不拿默认值顶上。"""
+    ws = DaemonWorkspace(cast("DaemonClient", _Canned(response)))
+    with pytest.raises(SandboxProtocolError):
+        await getattr(ws, operation)("a.txt")
+
+
+@pytest.mark.parametrize("bad_root", [None, "", "work", "//work", "/work/", "/work/../x", 7])
+def test_root_must_be_a_canonical_absolute_path(bad_root: object) -> None:
+    """握手信息里没有根目录、或它不是规范的绝对路径：SandboxProtocolError，不猜默认值。"""
+    ws = DaemonWorkspace(cast("DaemonClient", _Canned({}, root=bad_root)))
     with pytest.raises(SandboxProtocolError):
         _ = ws.root
     with pytest.raises(SandboxProtocolError):
         ws.resolve("a.txt")
+
+
+def test_resolve_collapses_leading_slashes() -> None:
+    """开头的多个 ``/`` 规整成一个：``//work/x`` 就是 ``/work/x``，``//etc`` 照样越界。"""
+    ws = DaemonWorkspace(cast("DaemonClient", _Canned({})))
+    assert ws.resolve("//work/x") == ws.resolve("///work//x") == "/work/x"
+    with pytest.raises(taifeng.WorkspacePathError):
+        ws.resolve("//etc/passwd")
+    assert DaemonWorkspace(cast("DaemonClient", _Canned({}, root="/"))).resolve("//x") == "/x"
 
 
 async def test_kernel_file_tools_write_then_read_through_the_daemon(

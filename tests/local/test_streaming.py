@@ -10,7 +10,9 @@ import pytest
 import taifeng
 
 from taifeng_sandbox import SandboxPolicy
+from taifeng_sandbox.daemon.process import DEFAULT_MAX_BUFFER_BYTES
 from taifeng_sandbox.local import create_local_executor
+from taifeng_sandbox.local.process import STREAM_LIMIT_BYTES
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -41,6 +43,11 @@ async def test_stdin_and_stdout_stream(tmp_path: Path) -> None:
         assert await asyncio.wait_for(proc.stdout.readline(), 10) == f"got:{word}\n".encode()
     proc.stdin.close()
     assert await asyncio.wait_for(proc.wait(), 10) == 0
+
+
+def test_stream_limit_matches_the_daemon_executor_buffer() -> None:
+    """本机流的单行上限与守护进程执行器每路缓冲的默认上限一致：两类后端能交出的单行一样长。"""
+    assert STREAM_LIMIT_BYTES == DEFAULT_MAX_BUFFER_BYTES == 16 * 1024 * 1024
 
 
 async def test_readline_reads_a_line_longer_than_the_asyncio_default(tmp_path: Path) -> None:
