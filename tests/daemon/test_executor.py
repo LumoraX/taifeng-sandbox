@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+import logging
+import sys
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from taifeng import (
@@ -15,16 +17,18 @@ from taifeng import (
     ScriptInvocation,
 )
 
-from taifeng_sandbox import shell_script_executor
+from taifeng_sandbox import SandboxProtocolError, shell_script_executor
 from taifeng_sandbox.daemon import (
     DaemonClient,
     DaemonCommandExecutor,
     RemoteProcess,
     StdioTransport,
+    protocol,
 )
 from tests.daemon.conftest import daemon_argv
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C.UTF-8"}
@@ -206,3 +210,139 @@ async def test_script_executor_over_daemon(client: DaemonClient, root: Path) -> 
     )
     assert timed_out.is_timeout
     assert timed_out.killed
+
+
+async def _until(condition: Callable[[], bool]) -> None:
+    """让出事件循环直到条件成立，最多等 5 秒。"""
+    async with asyncio.timeout(5):
+        while not condition():  # noqa: ASYNC110 —— 轮询白盒状态，没有可等的事件
+            await asyncio.sleep(0)
+
+
+class _RecordingRequests:
+    """替换 ``client.request``：记下发出的请求，以及每个请求落定后的结果。"""
+
+    def __init__(self, client: DaemonClient) -> None:
+        """包装 ``client`` 原来的 ``request``。"""
+        self._request = client.request
+        self.sent: list[str] = []
+        self.done: list[tuple[str, dict[str, Any] | None, dict[str, Any]]] = []
+
+    async def __call__(
+        self, method: str, params: dict[str, Any] | None = None, **kwargs: Any
+    ) -> dict[str, Any]:
+        """转交原来的 ``request`` 并记录。"""
+        self.sent.append(method)
+        result = await self._request(method, params, **kwargs)
+        self.done.append((method, params, result))
+        return result
+
+
+async def _cancel_once_sent(
+    executor: DaemonCommandExecutor, spec: CommandSpec, sent: list[str]
+) -> None:
+    """启动请求一发出就取消 ``start()``，再等后台善后结束。"""
+    start = asyncio.ensure_future(executor.start(spec))
+    await _until(lambda: bool(sent))
+    start.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await start
+    cleanups = list(executor._cleanups)  # noqa: SLF001 —— 白盒等后台善后
+    assert len(cleanups) == 1
+    await asyncio.wait_for(asyncio.gather(*cleanups), 10)
+
+
+async def test_cancelled_start_kills_the_started_process(
+    client: DaemonClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """启动请求已发出时 ``start()`` 被取消：等守护进程回了启动结果，再补发强杀，真的杀到进程。
+
+    进程是要标准输入、一直等着读的流式进程——不杀它会挂到连接关闭。强杀若紧跟着取消发出，会赶在
+    守护进程登记进程之前扑空（``killed`` 为假）。
+    """
+    recorder = _RecordingRequests(client)
+    monkeypatch.setattr(client, "request", recorder)
+    executor = DaemonCommandExecutor(client)
+    spec = CommandSpec(
+        command=f"{sys.executable} -c 'import sys; sys.stdin.read()'",
+        shell=False,
+        cwd=None,
+        env={},
+        stdin=True,
+    )
+    await _cancel_once_sent(executor, spec, recorder.sent)
+    assert [method for method, _, _ in recorder.done] == [
+        protocol.METHOD_PROCESS_START,
+        protocol.METHOD_PROCESS_KILL,
+    ]
+    (_, start_params, _), (_, kill_params, killed) = recorder.done
+    assert start_params is not None and kill_params is not None
+    assert kill_params["processId"] == start_params["processId"]
+    assert killed == {"killed": True}
+    assert client._handlers == {}  # noqa: SLF001 —— 撤销了通知登记
+
+
+class _HeldStart:
+    """守护进程连接的替身：启动请求挂到放行为止，强杀请求一律按连接已断失败。"""
+
+    closed = False
+
+    def __init__(self) -> None:
+        """记下收到的请求。"""
+        self.methods: list[str] = []
+        self.release = asyncio.Event()
+
+    def on_notification(self, method: str, process_id: str, handler: object) -> None:
+        """不分发通知。"""
+
+    def remove_handlers(self, process_id: str) -> None:
+        """没有登记可撤。"""
+
+    def on_disconnect(self, listener: object) -> Callable[[], None]:
+        """不会断开。"""
+        return lambda: None
+
+    async def request(self, method: str, params: dict[str, Any] | None = None, **_: Any) -> Any:
+        """启动请求等放行后成功；其他请求失败。"""
+        self.methods.append(method)
+        if method == protocol.METHOD_PROCESS_START:
+            await self.release.wait()
+            return {"pid": 1}
+        raise SandboxProtocolError("守护进程连接已断开")
+
+
+async def test_cancelled_start_kills_only_after_the_start_settles(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """善后先等启动请求落定才发强杀；强杀失败被取走并记 debug，不变成没人取的任务异常。"""
+    fake = _HeldStart()
+    executor = DaemonCommandExecutor(fake)  # type: ignore[arg-type]
+    start = asyncio.ensure_future(executor.start(_shell("true")))
+    await _until(lambda: bool(fake.methods))
+    start.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await start
+    cleanups = list(executor._cleanups)  # noqa: SLF001
+    await asyncio.sleep(0)
+    assert fake.methods == [protocol.METHOD_PROCESS_START]
+    with caplog.at_level(logging.DEBUG, logger="taifeng_sandbox.daemon.executor"):
+        fake.release.set()
+        await asyncio.wait_for(asyncio.gather(*cleanups), 5)
+    assert fake.methods == [protocol.METHOD_PROCESS_START, protocol.METHOD_PROCESS_KILL]
+    assert [record.levelno for record in caplog.records] == [logging.DEBUG]
+    assert "强杀放弃启动的进程" in caplog.text
+    assert executor._cleanups == set()  # noqa: SLF001
+
+
+async def test_failed_start_sends_no_kill(
+    client: DaemonClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """守护进程明确回了启动失败：进程没起来，不补发强杀。"""
+    recorder = _RecordingRequests(client)
+    monkeypatch.setattr(client, "request", recorder)
+    executor = DaemonCommandExecutor(client)
+    spec = CommandSpec(command="/no/such/binary", shell=False, cwd=None, env=dict(ENV))
+    with pytest.raises(FileNotFoundError):
+        await executor.start(spec)
+    assert recorder.sent == [protocol.METHOD_PROCESS_START]
+    assert executor._cleanups == set()  # noqa: SLF001

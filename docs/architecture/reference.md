@@ -122,7 +122,7 @@ async with await DockerEnvironment.create(config) as sandbox:
 | `client.request(method, params, timeout_seconds=None, no_timeout=False)` | 发请求。守护进程返回错误时抛 `SandboxRemoteError`；连接断开、等响应超时抛 `SandboxProtocolError`。`timeout_seconds` 为 `None` 用连接的默认时限；`no_timeout=True` 不限时等，只给 `process/write` 这类以背压为语义的请求用（连接断开照样结束，时限由调用方取消），两者不能同时给 |
 | `client.server_info` | 握手时守护进程上报的信息 |
 | `client.close()` | 发 `shutdown` 并关闭 |
-| `DaemonCommandExecutor(client, default_cwd=None, max_buffer_bytes=16 MiB)` | 实现 `CommandExecutor`。`CommandSpec.stdin=False` 时返回 `RemoteProcess`，每路输出在宿主侧最多保留 `max_buffer_bytes`，超出丢弃并计数；`stdin=True` 时返回 `StreamingRemoteProcess`，`max_buffer_bytes` 是每路未读字节的上限 |
+| `DaemonCommandExecutor(client, default_cwd=None, max_buffer_bytes=16 MiB)` | 实现 `CommandExecutor`。`CommandSpec.stdin=False` 时返回 `RemoteProcess`，每路输出在宿主侧最多保留 `max_buffer_bytes`，超出丢弃并计数；`stdin=True` 时返回 `StreamingRemoteProcess`，`max_buffer_bytes` 是每路未读字节的上限。`start()` 被取消或等启动响应超时：在后台等启动请求落定，守护进程起了进程就补发一次 `process/kill`（失败只记 debug），不留没人认领的进程 |
 | `RemoteProcess` | 一次性收输出的进程句柄，实现 `CommandProcess`。进程结束后 `communicate()` 返回两路输出，`dropped_bytes` 是因超限丢弃的字节数 |
 | `StreamingRemoteProcess` | 能持续对话的进程句柄，实现 `StreamingCommandProcess`，见下一节 |
 
