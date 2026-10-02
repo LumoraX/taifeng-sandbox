@@ -86,9 +86,9 @@ uv run pytest -q
 
 # 在 macOS 上用 Docker 起一个 Linux 容器跑本机后端用例（bubblewrap 要 --privileged 才能建命名空间）。
 # 仓库以只读方式挂进去，虚拟环境、uv 缓存与字节码都放在容器的 /tmp，不污染宿主仓库；
-# 开发期 taifeng 是同级目录的路径依赖，所以一并挂载。gcc 用来编测试用的 LD_PRELOAD 库。
+# taifeng 按 uv.lock 从 PyPI 安装。gcc 用来编测试用的 LD_PRELOAD 库。
 docker run --rm --privileged \
-  -v "$PWD":/src/taifeng-sandbox:ro -v "$PWD/../taifeng":/src/taifeng:ro \
+  -v "$PWD":/src/taifeng-sandbox:ro \
   -e UV_PROJECT_ENVIRONMENT=/tmp/venv -e UV_CACHE_DIR=/tmp/uv-cache \
   -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPYCACHEPREFIX=/tmp/pycache \
   -w /src/taifeng-sandbox python:3.12-slim bash -c '

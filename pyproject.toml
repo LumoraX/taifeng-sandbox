@@ -65,7 +65,3 @@ testpaths = ["tests"]
 python_version = "3.12"
 strict = true
 warn_unused_ignores = true
-
-# 内核 2026.10.1.10 发布到 PyPI 之前，开发期从同级目录取源码。发布后删掉这一段。
-[tool.uv.sources]
-taifeng = { path = "../taifeng", editable = true }
