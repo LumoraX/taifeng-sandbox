@@ -118,6 +118,36 @@ async def test_malformed_line_is_skipped(root: Path) -> None:
         await transport.close()
 
 
+async def test_params_must_be_an_object_when_given(root: Path) -> None:
+    """``params`` 给了却不是对象是 ``-32600``，缺省或 ``null`` 视为 ``{}``。
+
+    假值（``[]``、``0``、空串、``false``）同样是 ``-32600``，不被当作缺省；视为 ``{}`` 的请求照常
+    走到方法自己的参数校验。
+    """
+    transport = await StdioTransport.spawn(daemon_argv(root))
+    try:
+        reply = await _raw_exchange(
+            transport,
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": protocol.PROTOCOL_VERSION},
+            },
+        )
+        assert "result" in reply
+        request = {"jsonrpc": "2.0", "id": 2, "method": protocol.METHOD_PROCESS_KILL}
+        for params in ([], 0, "", False, ["processId"]):
+            reply = await _raw_exchange(transport, {**request, "params": params})
+            assert reply["error"]["code"] == protocol.ERROR_INVALID_REQUEST, params  # type: ignore[index]
+        for absent in ({}, {"params": None}):
+            reply = await _raw_exchange(transport, {**request, **absent})
+            # 视为 {}：缺 processId 是方法的参数错误，不是请求本身不合法
+            assert reply["error"]["code"] == protocol.ERROR_INVALID_PARAMS, absent  # type: ignore[index]
+    finally:
+        await transport.close()
+
+
 async def test_daemon_exit_fails_pending_and_later_requests(tmp_path: Path) -> None:
     """守护进程起不来：握手失败，错误里带上它的诊断输出。"""
     missing = tmp_path / "missing-root"

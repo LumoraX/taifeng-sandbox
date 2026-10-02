@@ -684,7 +684,7 @@ class Daemon:
         """处理一条请求并写回响应。通知（无 id）不回响应。"""
         request_id = message.get("id")
         method = message.get("method")
-        params = message.get("params") or {}
+        params = {} if message.get("params") is None else message["params"]  # 缺省、null 视为 {}
         if not isinstance(method, str) or not isinstance(params, dict):
             await self._reply_error(
                 request_id, ERROR_INVALID_REQUEST, "请求缺少 method 或 params 非对象"
