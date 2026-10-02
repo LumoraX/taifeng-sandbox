@@ -71,8 +71,8 @@ seatbelt 配置逐项放行 sysctl（不含进程列表与启动参数），出�
 | --- | --- | --- | --- |
 | macOS seatbelt | `local` | 可用 | macOS 上真跑 `sandbox-exec` |
 | Linux bubblewrap | `local` | 可用 | Linux 上真跑 `bwrap`（需要可用的用户命名空间） |
-| 线协议 + 守护进程 | — | 可用 | 守护进程作为子进程真跑 |
-| Docker 后端 | `docker` | 可用 | 真的拉起容器 |
+| 线协议 + 守护进程 | — | 可用 | 守护进程作为子进程真跑；另在 `python:3.9-slim` 容器里真跑握手、流式标准输入、原子写与删链接 |
+| Docker 后端 | `docker` | 可用 | 真的拉起容器，含内核 `McpStdioClient` 经容器执行器起 MCP server 的端到端用例 |
 | K8s 后端 | `k8s` | 未开始 | — |
 | E2B / Daytona 适配 | `e2b` / `daytona` | 未开始 | — |
 
