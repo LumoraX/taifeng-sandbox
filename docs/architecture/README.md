@@ -122,6 +122,7 @@ docker run --rm --privileged \
 | 协议 | taifeng 位置 | 在 taifeng 稳定层 |
 | --- | --- | --- |
 | `CommandExecutor` / `CommandProcess` / `CommandSpec` | `taifeng.tool.command_executor` | 是（taifeng ≥ 2026.9.30.1） |
+| `StreamingCommandProcess` / `CommandInput` / `CommandOutput` 与 `CommandSpec.stdin` | `taifeng.tool.command_executor` | 是（taifeng ≥ 2026.10.1.10） |
 | `ScriptExecutor` / `ScriptInvocation` / `ScriptResult` | `taifeng.skill.scripts` | 是 |
 | `WorkspaceFS` / `WorkspaceFileInfo` / `WorkspaceEntry` / `WorkspacePathError` | `taifeng.tool.workspace` | 是（taifeng ≥ 2026.10.1.10） |
 

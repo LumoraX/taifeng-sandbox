@@ -96,4 +96,7 @@ ADR 只增不改，以下旧条目的正文不动，只在 [决策索引](README
 - **取代 ADR 0003 后果第 2 条**：本机后端与守护进程执行器都支持流式进程（`CommandSpec.stdin=True` 时返回 `StreamingCommandProcess`）。
 - **补充 ADR 0003 决策 5** 的边界表（决策 5）与**决策 7** 的按组杀（决策 2）。
 - **闭环 ADR 0001 决策 1** 中「`WorkspaceFS` 对接口落地后同步接入」，以及 **ADR 0002 决策 1**「后者待 taifeng 落地」与**后果第 2 条**。
-- 守护进程 `server.py` 到 788 行，接近 800 行的硬上限。再加功能之前，要先决定怎样在保持「单文件注入」的前提下拆分。
+- 守护进程 `server.py` 接近 800 行的硬上限。**下一次给守护进程加功能之前，先按下面的方案拆分**（本 ADR 不做），注入方式不变：
+  - **拆成 `daemon/server/` 包，按五块分模块**：常量与参数校验；`PathGuard` 与原子替换；`FileService`；`ProcessService`；`Daemon` 与入口（`main`）。模块之间只用包内相对导入，除此之外只依赖标准库，语法仍兼容 Python 3.9。
+  - **`daemon_source()` 生成约 25 行的引导代码**：把各模块源码放进「模块名 → 源码」字典，注册一个 `importlib.abc.MetaPathFinder`（兼作 loader），从字典里加载包内模块，再调入口的 `main()`。仍是一条 `python3 -c`，镜像里照样不需要安装本包。
+  - **配套测试**：AST 检查每个模块只 import 标准库与包内相对导入；`len(daemon_source().encode()) < 100 KiB`——`python3 -c` 的源码是单个命令行参数，Linux 单个参数上限 `MAX_ARG_STRLEN` 是 128 KiB，留出余量。

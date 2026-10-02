@@ -42,6 +42,8 @@
 | 输出 | `communicate()` 读完两路输出并等退出；`CommandSpec.stdin=True` 时还可经 `stdin` / `stdout` / `stderr` 三个流持续读写（实现 `StreamingCommandProcess`）。`readline()` 的单行上限是 16 MiB（与 `DaemonCommandExecutor` 的 `max_buffer_bytes` 默认值一致；asyncio 默认只有 64 KiB），MCP server 的单条大响应能整行读出 |
 | 资源限制 | 不限制内存与 CPU。需要的话用容器后端 |
 
+经本机后端起 MCP server 时要显式给 `cwd`：`taifeng.McpStdioClient.spawn(argv, executor=executor, cwd=…)`。`cwd=None` 时 bubblewrap 后端取宿主进程的当前目录，受限读策略（如 `workspace_only`）下沙盒里通常看不到它，bwrap 会启动失败；给工作区或 server 所在的、策略里可读的目录。
+
 两个后端对同一份策略的翻译：
 
 | | seatbelt（macOS） | bubblewrap（Linux） |
