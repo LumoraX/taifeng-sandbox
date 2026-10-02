@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import os
 import shlex
 import sys
@@ -186,6 +185,9 @@ def _sealed_memfd(data: bytes) -> int:
     # 这里直接判断 sys.platform：memfd 与封口常量只在 Linux 的类型存根里，需要让类型检查器收窄
     if sys.platform != "linux":
         raise SandboxUnavailableError("memfd 只在 Linux 上可用")
+    # fcntl 在这里才导入：守护进程执行器经 command_argv 导入本模块，不连带依赖类 Unix 专有模块
+    import fcntl
+
     fd = os.memfd_create("taifeng-sandbox-bwrap-args", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
     try:
         view = memoryview(data)
