@@ -215,3 +215,5 @@ tools = [
 返回 `dict[str, ExportedFile]`，每个 `ExportedFile` 有不可变 `content`、`sha256`、`size`。
 实现固定根目录描述符，逐级不跟随符号链接，拒绝空文件、硬链接、特殊文件、重复路径、读取超限以及读取中变化的文件。
 取消会等待正在进行的有界读取关闭描述符，再传播取消。
+
+`SandboxOperationOutcomeUnknownError` 是 `SandboxUnavailableError` 的子类：命令超时后即使本地CLI已被回收，远端操作仍需核实。宿主应保留已知名称及未完成清理责任，不把一次不存在响应当作创建请求绝不会迟到的证据。

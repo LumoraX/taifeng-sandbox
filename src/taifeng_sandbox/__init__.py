@@ -17,6 +17,7 @@ from importlib.metadata import version
 
 from taifeng_sandbox.errors import (
     SandboxError,
+    SandboxOperationOutcomeUnknownError,
     SandboxPolicyError,
     SandboxProtocolError,
     SandboxRemoteError,
@@ -34,6 +35,7 @@ __all__ = [
     "ExportedFile",
     "export_files",
     "SandboxError",
+    "SandboxOperationOutcomeUnknownError",
     "SandboxPolicy",
     "SandboxPolicyError",
     "SandboxProtocolError",

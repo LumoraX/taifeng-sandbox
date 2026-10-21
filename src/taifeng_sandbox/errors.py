@@ -16,6 +16,10 @@ class SandboxUnavailableError(SandboxError):
     """所需的隔离后端在当前环境不可用（缺可执行文件、平台不支持、守护进程连不上）。"""
 
 
+class SandboxOperationOutcomeUnknownError(SandboxUnavailableError):
+    """命令已发出但没有确定结果；本地子进程退出不证明远端未执行。"""
+
+
 class SandboxPolicyError(ValueError):
     """隔离策略本身不合法（相对路径、互相矛盾的根目录等）。"""
 
@@ -39,6 +43,7 @@ class SandboxRemoteError(SandboxError):
 
 __all__ = [
     "SandboxError",
+    "SandboxOperationOutcomeUnknownError",
     "SandboxPolicyError",
     "SandboxProtocolError",
     "SandboxRemoteError",

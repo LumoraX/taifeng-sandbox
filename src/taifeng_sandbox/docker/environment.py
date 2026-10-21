@@ -24,6 +24,7 @@ from taifeng_sandbox.docker.config import (
 )
 from taifeng_sandbox.errors import (
     SandboxError,
+    SandboxOperationOutcomeUnknownError,
     SandboxProtocolError,
     SandboxUnavailableError,
 )
@@ -60,7 +61,7 @@ async def _run_docker(
         await _settle(asyncio.create_task(proc.wait()))
         if isinstance(exc, asyncio.CancelledError):
             raise
-        raise SandboxUnavailableError(f"docker 命令超时（{timeout_seconds:.0f}s）；操作结果需核实") from exc
+        raise SandboxOperationOutcomeUnknownError(f"docker 命令超时（{timeout_seconds:.0f}s）；操作结果需核实") from exc
     assert proc.returncode is not None
     return proc.returncode, stdout.decode(errors="replace"), stderr.decode(errors="replace")
 
