@@ -10,7 +10,7 @@ import asyncio
 import contextlib
 import logging
 import secrets
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Self, TypeVar
 
 from taifeng_sandbox.daemon.client import DaemonClient, daemon_source
 from taifeng_sandbox.daemon.executor import DaemonCommandExecutor
@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _REMOVE_TIMEOUT_SECONDS = 30.0
+_T = TypeVar("_T")
 
 
 async def _run_docker(
@@ -53,13 +54,25 @@ async def _run_docker(
         raise SandboxUnavailableError(f"无法运行 docker 命令：{exc}") from exc
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
-    except TimeoutError as exc:
+    except (TimeoutError, asyncio.CancelledError) as exc:
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
-        await proc.wait()
-        raise SandboxUnavailableError(f"docker 命令超时（{timeout_seconds:.0f}s）") from exc
+        await _settle(asyncio.create_task(proc.wait()))
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        raise SandboxUnavailableError(f"docker 命令超时（{timeout_seconds:.0f}s）；操作结果需核实") from exc
     assert proc.returncode is not None
     return proc.returncode, stdout.decode(errors="replace"), stderr.decode(errors="replace")
+
+
+async def _settle(task: asyncio.Task[_T]) -> _T:
+    """等待已经发起的资源操作结算，重复取消不能丢弃其所有权。"""
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    return task.result()
 
 
 class DockerEnvironment:
@@ -90,11 +103,19 @@ class DockerEnvironment:
         """
         container = validate_container_name(name or "tfsb-" + secrets.token_hex(8))
         env = dict(config.docker_env)
-        code, _, stderr = await _run_docker(
+        launch = asyncio.create_task(_run_docker(
             build_run_argv(config, container),
             env=env,
             timeout_seconds=config.startup_timeout_seconds,
-        )
+        ))
+        try:
+            code, _, stderr = await asyncio.shield(launch)
+        except asyncio.CancelledError:
+            try:
+                await _settle(launch)
+            finally:
+                await _settle(asyncio.create_task(_remove_container(config, container)))
+            raise
         if code != 0:
             raise SandboxUnavailableError(f"容器启动失败：{stderr.strip()}")
         try:
