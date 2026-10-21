@@ -78,6 +78,7 @@ class DockerEnvironment:
         self._name = name
         self._client = client
         self._closed = False
+        self._close_lock = asyncio.Lock()
 
     @classmethod
     async def create(cls, config: DockerSandboxConfig, *, name: str | None = None) -> Self:
@@ -133,14 +134,24 @@ class DockerEnvironment:
         return DaemonWorkspace(self._client)
 
     async def close(self) -> None:
-        """断开守护进程并销毁容器。可重复调用。"""
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            await self._client.close()
-        finally:
-            await _remove_container(self._config, self._name)
+        """断开守护进程并销毁容器；只有删除成功后才记为已关闭，失败可重试。"""
+        async with self._close_lock:
+            if self._closed:
+                return
+            try:
+                await self._client.close()
+            finally:
+                await self.remove(self._config, self._name)
+            self._closed = True
+
+    @staticmethod
+    async def remove(config: DockerSandboxConfig, name: str) -> None:
+        """删除宿主预分配名称的容器，创建未返回句柄时仍可保留清理责任。
+
+        名称先校验；不存在视为已删除，其余故障必须抛出。调用者不得据内部连接状态
+        推断删除成功，也不应通过扫描无关容器代替这项明确资源操作。
+        """
+        await _remove_container(config, validate_container_name(name))
 
     async def __aenter__(self) -> Self:
         """进入上下文。"""

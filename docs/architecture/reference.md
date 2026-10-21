@@ -88,6 +88,13 @@ async with await DockerEnvironment.create(config) as sandbox:
 
 退出 `async with`（或调 `close()`）时断开连接并销毁容器。
 
+`close()` 串行处理并发关闭；只有容器删除成功才记为已关闭。删除失败会抛错，之后调用仍真正重试，
+不会因为daemon连接已经关闭就假定容器已退出。宿主在清理失败时必须继续保留该句柄。
+
+宿主可以用 `DockerEnvironment.create(config, name=已分配名称)` 固定资源身份；即使启动未返回句柄，
+仍可通过 `await DockerEnvironment.remove(config, name)` 清理这一确定容器。名称会校验，不存在视为已删除，
+其他错误保持失败。调用者不能仅凭启动异常推断没有遗留资源，也不要扫描删除无关容器。
+
 ### `DockerSandboxConfig`
 
 | 字段 | 默认 | 说明 |

@@ -1,6 +1,6 @@
 [project]
 name = "taifeng-sandbox"
-version = "2026.9.29.15"
+version = "2026.10.21.1"
 description = "taifeng 执行隔离适配层 —— 把 CommandExecutor / ScriptExecutor 接到本机隔离、容器与远端沙盒"
 readme = "README.md"
 requires-python = ">=3.12"

@@ -85,6 +85,34 @@ async def test_workspace_files_visible_to_commands(sandbox: DockerEnvironment) -
     assert (await workspace.read_text("output.txt")).strip() == "from-box"
 
 
+async def test_close_retry_really_removes_container(monkeypatch: pytest.MonkeyPatch) -> None:
+    """真实容器第一次删除失败，第二次关闭必须真正删除而非只返回成功。"""
+    from taifeng_sandbox import SandboxError
+    from taifeng_sandbox.docker import environment as module
+
+    environment = await DockerEnvironment.create(sandbox_config())
+    remove = module._remove_container
+    count = 0
+
+    async def fail_once(config, name):
+        """首次故障后保留容器，随后使用真实docker删除。"""
+        nonlocal count
+        count += 1
+        if count == 1:
+            raise SandboxError("injected docker rm failure")
+        await remove(config, name)
+
+    try:
+        monkeypatch.setattr(module, "_remove_container", fail_once)
+        with pytest.raises(SandboxError, match="injected"):
+            await environment.close()
+        assert _container_exists(environment.name)
+        await environment.close()
+        assert not _container_exists(environment.name)
+    finally:
+        await remove(environment.config, environment.name)
+
+
 async def test_root_daemon_overwrites_without_cap_chown(sandbox: DockerEnvironment) -> None:
     """容器里守护进程是 root 但没有任何 capability：覆盖自己的文件照常成功，权限位与属主保持。
 

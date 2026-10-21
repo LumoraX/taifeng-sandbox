@@ -592,7 +592,7 @@ wheels = [
 
 [[package]]
 name = "taifeng-sandbox"
-version = "2026.9.29.15"
+version = "2026.10.21.1"
 source = { editable = "." }
 dependencies = [
     { name = "taifeng" },
