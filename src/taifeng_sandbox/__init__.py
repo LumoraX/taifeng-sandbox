@@ -22,6 +22,7 @@ from taifeng_sandbox.errors import (
     SandboxRemoteError,
     SandboxUnavailableError,
 )
+from taifeng_sandbox.export import ExportedFile, export_files
 from taifeng_sandbox.policy import SandboxPolicy
 from taifeng_sandbox.script import (
     SandboxedScriptExecutor,
@@ -30,6 +31,8 @@ from taifeng_sandbox.script import (
 )
 
 __all__ = [
+    "ExportedFile",
+    "export_files",
     "SandboxError",
     "SandboxPolicy",
     "SandboxPolicyError",
