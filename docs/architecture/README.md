@@ -59,6 +59,8 @@ taifeng 工具层（审批 / 黑名单 / env 白名单 / 超时 / 截断 / 取�
 
 环境变量在每一层都是「给什么用什么」：执行器把 `CommandSpec.env` 当作完整环境，不叠加宿主环境；守护进程同样不把自己的环境传给子进程。
 
+Linux 受限读视图以空 tmpfs 为根，系统目录、显式只读根与可写工作区分别挂载。全部挂载点创建完成后，对根执行非递归的 `--remount-ro /`，使空根及自动创建的挂载父目录只读，工作区的独立可写绑定保持可写。目录遮蔽使用的 tmpfs 在两种读范围下都设为只读；嵌套遮蔽先挂父目录再挂子目录，全部挂载完成后再逐个重挂载只读，输入顺序不改变边界。[bubblewrap 文档](https://github.com/containers/bubblewrap/blob/main/bwrap.xml)明确说明 `--remount-ro` 只作用于指定挂载点，不递归改变子挂载。
+
 本机后端的启动器（沙盒外的 `bwrap` 进程）本身不受被隔离一方影响：它只拿固定的空环境、工作目录固定为 `/`；`CommandSpec.env` 经 `--args` 读取的封口 memfd 以 `--setenv` 交给 bwrap，只在沙盒里的目标进程上生效，值也不进命令行（[ADR 0005](../decisions/0005-local-launcher-and-seatbelt-hardening.md) 决策 1）。
 
 memfd 必须成功添加禁止写入、增长、收缩及再次修改封口的四个内核封口，才会交给启动器。若 Python 构建未导出 `fcntl.F_ADD_SEALS` 或 `F_SEAL_*`，使用 [Linux UAPI `linux/fcntl.h`](https://github.com/torvalds/linux/blob/master/include/uapi/linux/fcntl.h) 与 [`asm-generic/fcntl.h`](https://github.com/torvalds/linux/blob/master/include/uapi/asm-generic/fcntl.h) 定义的固定 ABI 值调用同一个 `fcntl` 系统调用；内核拒绝封口仍关闭 fd 并抛错，不改变传参或隔离机制。Linux 专用测试直接校验封口位并确认写入、扩容、缩容与再次封口均被内核拒绝，不依赖 bubblewrap 或用户命名空间权限。

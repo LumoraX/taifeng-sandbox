@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import shlex
 import shutil
@@ -106,6 +107,83 @@ async def test_restricted_read_hides_unlisted_directories(tmp_path: Path) -> Non
     code, _, _ = await _run(executor, _shell(f"echo x > {shared / 'a.txt'}", workspace))
     assert code != 0
     assert (shared / "a.txt").read_text() == "shared-data"
+
+
+WRITE_PROBE = """\
+import json, pathlib, sys
+report = {}
+for target in json.loads(sys.argv[1]):
+    try:
+        pathlib.Path(target).write_text("sandbox-write")
+        report[target] = 0
+    except OSError as exc:
+        report[target] = exc.errno
+print(json.dumps(report))
+"""
+
+
+async def test_restricted_root_and_mount_parents_are_read_only(tmp_path: Path) -> None:
+    """空根和自动创建的挂载父目录只读，深层工作区绑定仍可写且落到宿主。"""
+    workspace = tmp_path / "workspaces" / "tenant" / "run"
+    shared = tmp_path / "packages" / "tenant" / "package"
+    workspace.mkdir(parents=True)
+    shared.mkdir(parents=True)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("host-only")
+    denied = (Path("/escape.txt"), workspace.parent / "escape.txt", shared.parent / "escape.txt",
+              outside)
+    allowed = workspace / "ok.txt"
+    command = shlex.join([sys.executable, "-c", WRITE_PROBE,
+                          json.dumps([str(path) for path in (*denied, allowed)])])
+    executor = BwrapCommandExecutor(
+        SandboxPolicy.workspace_only(workspace, readable_roots=(shared,))
+    )
+    code, out, err = await _run(executor, _shell(command, workspace))
+    assert code == 0, err
+    report = json.loads(out)
+    assert report[str(allowed)] == 0
+    assert allowed.read_text() == "sandbox-write"
+    for target in denied:
+        assert report[str(target)] == errno.EROFS, f"工作区外仍可写：{target}；全部探针：{report}"
+    assert outside.read_text() == "host-only"
+    assert not (workspace.parent / "escape.txt").exists()
+    assert not (shared.parent / "escape.txt").exists()
+
+
+@pytest.mark.parametrize("restricted", [False, True])
+@pytest.mark.parametrize("child_first", [False, True])
+async def test_masked_directories_are_read_only(
+    tmp_path: Path, restricted: bool, child_first: bool
+) -> None:
+    """两种读范围的目录遮蔽均只读，嵌套遮蔽可完成挂载，工作区仍真实可写。"""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    masked = workspace / "secret"
+    nested = masked / "nested"
+    nested.mkdir(parents=True)
+    (masked / "token").write_text("secret")
+    (nested / "token").write_text("nested-secret")
+    allowed = workspace / "ok.txt"
+    denied = (masked / "created.txt", nested / "created.txt")
+    command = shlex.join([sys.executable, "-c", WRITE_PROBE,
+                          json.dumps([str(path) for path in (*denied, allowed)])])
+    policy = SandboxPolicy(
+        read_scope="restricted" if restricted else "all",
+        writable_roots=(workspace,),
+        unreadable_roots=(nested, masked) if child_first else (masked, nested),
+    )
+    code, out, err = await _run(BwrapCommandExecutor(policy), _shell(command, workspace))
+    assert code == 0, err
+    report = json.loads(out)
+    assert report[str(allowed)] == 0
+    assert allowed.read_text() == "sandbox-write"
+    for target in denied:
+        assert report[str(target)] == errno.EROFS, f"遮蔽目录仍可写：{target}；全部探针：{report}"
+    code, out, err = await _run(
+        BwrapCommandExecutor(policy), _shell(f"cat {masked / 'token'} {nested / 'token'}", workspace)
+    )
+    assert code != 0
+    assert out == "", err
 
 
 async def test_network_namespace_isolated_by_default(tmp_path: Path) -> None:

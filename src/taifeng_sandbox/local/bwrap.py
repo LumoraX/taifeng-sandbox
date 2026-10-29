@@ -70,14 +70,19 @@ def _read_view_args(policy: SandboxPolicy) -> list[str]:
 
 
 def _mask_args(policy: SandboxPolicy, file_paths: Collection[str]) -> list[str]:
-    """遮蔽不可读路径：目录盖空 tmpfs，文件换成 ``/dev/null``。"""
+    """遮蔽不可读路径：目录盖只读空 tmpfs，文件换成 ``/dev/null``。"""
     args: list[str] = []
-    for blocked in policy.unreadable_roots:
+    # 父遮蔽必须先挂载，否则会盖掉已建好的子挂载；策略的输入顺序不应影响边界。
+    for blocked in sorted(policy.unreadable_roots, key=lambda path: len(path.parts)):
         target = str(blocked)
         if target in file_paths:
             args.extend(["--ro-bind", "/dev/null", target])
         else:
             args.extend(["--tmpfs", target])
+    # 先完成全部嵌套挂载，再逐个把遮蔽 tmpfs 设为只读，避免提前阻止子挂载点的创建。
+    for blocked in policy.unreadable_roots:
+        if str(blocked) not in file_paths:
+            args.extend(["--remount-ro", str(blocked)])
     return args
 
 
@@ -140,6 +145,9 @@ def build_argv(
     for writable in policy.writable_roots:
         argv.extend(["--bind", str(writable), str(writable)])
     argv.extend(_mask_args(policy, unreadable_files))
+    if policy.read_scope == "restricted":
+        # 空根及自动创建的挂载父目录不能写；非递归重挂载保留工作区等子挂载的独立权限。
+        argv.extend(["--remount-ro", "/"])
     argv.extend(["--unshare-user", "--unshare-pid", "--unshare-ipc"])
     if not policy.network:
         argv.append("--unshare-net")
