@@ -61,6 +61,8 @@ taifeng 工具层（审批 / 黑名单 / env 白名单 / 超时 / 截断 / 取�
 
 本机后端的启动器（沙盒外的 `bwrap` 进程）本身不受被隔离一方影响：它只拿固定的空环境、工作目录固定为 `/`；`CommandSpec.env` 经 `--args` 读取的封口 memfd 以 `--setenv` 交给 bwrap，只在沙盒里的目标进程上生效，值也不进命令行（[ADR 0005](../decisions/0005-local-launcher-and-seatbelt-hardening.md) 决策 1）。
 
+memfd 必须成功添加禁止写入、增长、收缩及再次修改封口的四个内核封口，才会交给启动器。若 Python 构建未导出 `fcntl.F_ADD_SEALS` 或 `F_SEAL_*`，使用 [Linux UAPI `linux/fcntl.h`](https://github.com/torvalds/linux/blob/master/include/uapi/linux/fcntl.h) 与 [`asm-generic/fcntl.h`](https://github.com/torvalds/linux/blob/master/include/uapi/asm-generic/fcntl.h) 定义的固定 ABI 值调用同一个 `fcntl` 系统调用；内核拒绝封口仍关闭 fd 并抛错，不改变传参或隔离机制。Linux 专用测试直接校验封口位并确认写入、扩容、缩容与再次封口均被内核拒绝，不依赖 bubblewrap 或用户命名空间权限。
+
 seatbelt 配置逐项放行 sysctl（不含进程列表与启动参数），出网时只放行 IP 远端与 DNS 用的 mDNSResponder 套接字，本机其他 Unix 套接字（Docker 守护进程、ssh-agent、本地数据库）一律连不上（ADR 0005 决策 2、3）。
 
 **macOS 本机后端不是对抗性隔离。** 沙盒里的进程仍能读到同一用户下所有非平台进程的完整参数与初始环境（`KERN_PROCARGS2`，seatbelt 管不到，见 ADR 0005 决策 2）；出网时能连本机任意 TCP 端口。运行不受信任的命令时，宿主不要把密钥放在同用户进程的环境变量里，或让命令以另一个系统用户运行，或改用容器后端。

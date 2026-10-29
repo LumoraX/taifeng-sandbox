@@ -182,22 +182,28 @@ def _sealed_memfd(data: bytes) -> int:
     内容常含密钥。封口（禁止写入、增长、收缩）之后，即使有人经 ``/proc/<pid>/fd``
     打开它，也改不了 bwrap 将要读到的参数。
     """
-    # 这里直接判断 sys.platform：memfd 与封口常量只在 Linux 的类型存根里，需要让类型检查器收窄
+    # 这里直接判断 sys.platform：memfd 只在 Linux 的类型存根里，需要让类型检查器收窄
     if sys.platform != "linux":
         raise SandboxUnavailableError("memfd 只在 Linux 上可用")
     # fcntl 在这里才导入：守护进程执行器经 command_argv 导入本模块，不连带依赖类 Unix 专有模块
     import fcntl
 
+    # 某些 Python 构建没有导出封口常量；缺失时使用 Linux UAPI 的固定 ABI 值，仍调用内核封口。
+    # 来源：include/uapi/linux/fcntl.h 与 include/uapi/asm-generic/fcntl.h；
+    # 只引用 syscall 常量（GPL-2.0 WITH Linux-syscall-note），不复用内核实现。
+    add_seals = getattr(fcntl, "F_ADD_SEALS", 1033)  # F_LINUX_SPECIFIC_BASE (1024) + 9
+    seals = (
+        getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+        | getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+        | getattr(fcntl, "F_SEAL_GROW", 0x0004)
+        | getattr(fcntl, "F_SEAL_WRITE", 0x0008)
+    )
     fd = os.memfd_create("taifeng-sandbox-bwrap-args", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
     try:
         view = memoryview(data)
         while view:
             view = view[os.write(fd, view) :]
-        fcntl.fcntl(
-            fd,
-            fcntl.F_ADD_SEALS,
-            fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE,
-        )
+        fcntl.fcntl(fd, add_seals, seals)
         os.lseek(fd, 0, os.SEEK_SET)
     except BaseException:
         os.close(fd)
